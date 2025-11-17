@@ -1,0 +1,14 @@
+{
+  "workflow": {
+    "enable": true,
+    "poll_interval": 1.0,
+    "task_default_timeout": 1800.0,
+    "auto_evaluate": true,
+    "log_every_n_iterations": 10,
+    "poll_sleep_multiplier": 2.0
+  },
+  "execution": {
+    "max_execution_time": 3600.0,
+    "max_iterations": null
+  }
+}

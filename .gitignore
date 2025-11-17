@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+.pytest_cache/
+
+# MCP servers
+fastagent/tool/mcp_servers/
+
+# Config files
+fastagent/config/config_dev.json
+
+# Environment files
+.env
+!.env.example
+
+# LLM key
+fastagent/llm/remote_client/
+
+# Local server initialization files
+fastagent/local_server/temp/
+
+# Embedding cache
+.fastagent/
+
+# Logs
+logs/
+
+examples/

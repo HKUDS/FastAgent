@@ -1,0 +1,20 @@
+{
+  "agents": [
+    {
+      "name": "HostAgent",
+      "class_name": "HostAgent",
+      "backend_scope": []
+    },
+    {
+      "name": "GroundingAgent",
+      "class_name": "GroundingAgent",
+      "backend_scope": ["gui", "shell", "mcp", "system", "web"],
+      "max_iterations": 20
+    },
+    { 
+      "name": "EvalAgent",
+      "class_name": "EvalAgent",
+      "backend_scope": ["shell"]
+    }
+  ]
+}
