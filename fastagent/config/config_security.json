@@ -57,7 +57,7 @@
         "sandbox_enabled": false
       },
       "mcp": {
-        "sandbox_enabled": true
+        "sandbox_enabled": false
       },
       "web": {
         "allow_network_access": true,

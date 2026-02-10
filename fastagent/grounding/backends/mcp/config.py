@@ -35,6 +35,8 @@ async def create_connector_from_config(
     sse_read_timeout: float = 300.0,
     installer: Optional[MCPInstallerManager] = None,
     check_dependencies: bool = True,
+    tool_call_max_retries: int = 3,
+    tool_call_retry_delay: float = 1.0,
 ) -> MCPBaseConnector:
     """Create a connector based on server configuration.
     
@@ -47,6 +49,8 @@ async def create_connector_from_config(
         sse_read_timeout: SSE read timeout in seconds (default: 300.0)
         installer: Optional installer manager for dependency installation
         check_dependencies: Whether to check and install dependencies (default: True)
+        tool_call_max_retries: Maximum number of retries for tool calls (default: 3)
+        tool_call_retry_delay: Initial delay between retries in seconds (default: 1.0)
 
     Returns:
         A configured connector instance
@@ -55,18 +59,19 @@ async def create_connector_from_config(
         RuntimeError: If dependencies are not installed and user declines installation
     """
     
+    # Get original command and args from config
+    original_command = get_config_value(server_config, "command")
+    original_args = get_config_value(server_config, "args", [])
+
     # Check and install dependencies if needed (only for stdio servers)
     if is_stdio_server(server_config) and check_dependencies:
-        command = get_config_value(server_config, "command")
-        args = get_config_value(server_config, "args", [])
-        
         # Use provided installer or get global instance
         if installer is None:
             from .installer import get_global_installer
             installer = get_global_installer()
-        
-        # Ensure dependencies are installed
-        await installer.ensure_dependencies(server_name, command, args)
+
+        # Ensure dependencies are installed (using original command/args)
+        await installer.ensure_dependencies(server_name, original_command, original_args)
 
     # Stdio connector (command-based)
     if is_stdio_server(server_config) and not sandbox:
@@ -112,6 +117,8 @@ async def create_connector_from_config(
             auth_token=get_config_value(server_config, "auth_token", None),
             timeout=timeout,
             sse_read_timeout=sse_read_timeout,
+            tool_call_max_retries=tool_call_max_retries,
+            tool_call_retry_delay=tool_call_retry_delay,
         )
 
     # WebSocket connector

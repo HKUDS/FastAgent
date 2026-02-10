@@ -68,7 +68,7 @@ class GUIAgentTool(BaseTool):
     async def _arun(
         self,
         task_description: str,
-        max_steps: int = 25,  # Balanced default for most tasks
+        max_steps: int = 50,
     ) -> ToolResult:
         """
         Execute a GUI automation task using LLM planning.
@@ -99,21 +99,6 @@ class GUIAgentTool(BaseTool):
         
         logger.info(f"Starting GUI task: {task_description}")
         self.action_history = []
-        
-        # Check if we have recording_manager (directly or via runtime_info)
-        has_recording = self.recording_manager is not None
-        if not has_recording and hasattr(self, '_runtime_info') and self._runtime_info:
-            grounding_client = self._runtime_info.grounding_client
-            if grounding_client and hasattr(grounding_client, 'recording_manager'):
-                has_recording = grounding_client.recording_manager is not None
-        
-        # Only disable outer layer recording if we have recording_manager for intermediate steps
-        if has_recording:
-            self._disable_outer_recording = True
-            logger.debug("Outer recording disabled (using intermediate step recording)")
-        else:
-            self._disable_outer_recording = False
-            logger.debug("Outer recording enabled (no recording_manager for intermediate steps)")
         
         # Execute task with LLM planning loop
         try:
@@ -157,6 +142,11 @@ class GUIAgentTool(BaseTool):
         Returns:
             ToolResult with execution details
         """
+        # Collect all screenshots for visual analysis
+        all_screenshots = []
+        # Collect intermediate steps
+        intermediate_steps = []
+        
         for step in range(max_steps):
             logger.info(f"Planning step {step + 1}/{max_steps}")
             
@@ -169,6 +159,9 @@ class GUIAgentTool(BaseTool):
                     metadata={"step": step, "action_history": self.action_history}
                 )
             
+            # Collect screenshot for visual analysis
+            all_screenshots.append(screenshot)
+            
             # Step 2: Plan next action using LLM
             planned_action = await self._plan_next_action(
                 task_description=task_description,
@@ -179,17 +172,14 @@ class GUIAgentTool(BaseTool):
             # Check if task is complete
             if planned_action["action_type"] == "DONE":
                 logger.info("Task marked as complete by LLM")
-                # Record final step (observation only)
-                await self._record_intermediate_step(
-                    step_number=step + 1,
-                    planned_action=planned_action,
-                    execution_result={"status": "done", "message": "Task completed"},
-                    screenshot=screenshot,
-                    task_description=task_description,
-                )
-                
-                # Return with task completion info and screenshot
                 reasoning = planned_action.get("reasoning", "Task completed successfully")
+                
+                intermediate_steps.append({
+                    "step_number": step + 1,
+                    "action": "DONE",
+                    "reasoning": reasoning,
+                    "status": "done",
+                })
                 
                 return ToolResult(
                     status=ToolStatus.SUCCESS,
@@ -197,7 +187,8 @@ class GUIAgentTool(BaseTool):
                     metadata={
                         "steps_taken": step + 1,
                         "action_history": self.action_history,
-                        "screenshot": screenshot,
+                        "screenshots": all_screenshots,
+                        "intermediate_steps": intermediate_steps,
                         "final_reasoning": reasoning,
                     }
                 )
@@ -205,35 +196,35 @@ class GUIAgentTool(BaseTool):
             # Check if task failed
             if planned_action["action_type"] == "FAIL":
                 logger.warning("Task marked as failed by LLM")
-                # Record final step (failure)
-                await self._record_intermediate_step(
-                    step_number=step + 1,
-                    planned_action=planned_action,
-                    execution_result={"status": "failed", "message": planned_action.get("reason", "Task cannot be completed")},
-                    screenshot=screenshot,
-                    task_description=task_description,
-                )
+                reason = planned_action.get("reason", "Task cannot be completed")
+                
+                intermediate_steps.append({
+                    "step_number": step + 1,
+                    "action": "FAIL",
+                    "reasoning": planned_action.get("reasoning", ""),
+                    "status": "failed",
+                })
+                
                 return ToolResult(
                     status=ToolStatus.ERROR,
-                    error=planned_action.get("reason", "Task cannot be completed"),
+                    error=reason,
                     metadata={
                         "steps_taken": step + 1,
                         "action_history": self.action_history,
+                        "screenshots": all_screenshots,
+                        "intermediate_steps": intermediate_steps,
                     }
                 )
             
             # Check if action is WAIT (screenshot observation, continue to next step)
             if planned_action["action_type"] == "WAIT":
                 logger.info("Screenshot observation step, continuing planning loop")
-                # Record observation step
-                await self._record_intermediate_step(
-                    step_number=step + 1,
-                    planned_action=planned_action,
-                    execution_result={"status": "observation", "message": "Screenshot captured"},
-                    screenshot=screenshot,
-                    task_description=task_description,
-                )
-                # Just continue to next iteration
+                intermediate_steps.append({
+                    "step_number": step + 1,
+                    "action": "WAIT",
+                    "reasoning": planned_action.get("reasoning", ""),
+                    "status": "observation",
+                })
                 continue
             
             # Step 3: Execute the planned action
@@ -246,14 +237,12 @@ class GUIAgentTool(BaseTool):
                 "execution_result": execution_result,
             })
             
-            # Step 4: Record this intermediate step to recording system
-            await self._record_intermediate_step(
-                step_number=step + 1,
-                planned_action=planned_action,
-                execution_result=execution_result,
-                screenshot=screenshot,
-                task_description=task_description,
-            )
+            intermediate_steps.append({
+                "step_number": step + 1,
+                "action": planned_action.get("action_type", "unknown"),
+                "reasoning": planned_action.get("reasoning", ""),
+                "status": execution_result.get("status", "unknown"),
+            })
             
             # Check execution result
             if execution_result.get("status") != "success":
@@ -268,6 +257,8 @@ class GUIAgentTool(BaseTool):
                 "task_description": task_description,
                 "steps_taken": max_steps,
                 "action_history": self.action_history,
+                "screenshots": all_screenshots,
+                "intermediate_steps": intermediate_steps,
             }
         )
     

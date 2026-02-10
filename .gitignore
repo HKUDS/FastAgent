@@ -18,26 +18,33 @@ Desktop.ini
 .idea/
 .pytest_cache/
 
-# MCP servers
-fastagent/tool/mcp_servers/
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Environment files
+.env
+
+# MCP files
+fastagent/config/config_mcp.json
+
+# Logs
+logs/
+
+# Embedding cache
+.fastagent/
+embedding_cache/
+tool_quality/
 
 # Config files
 fastagent/config/config_dev.json
 
-# Environment files
-.env
-!.env.example
-
-# LLM key
+# LLM keys
 fastagent/llm/remote_client/
 
-# Local server initialization files
+# Local server temp files
 fastagent/local_server/temp/
-
-# Embedding cache
-.fastagent/
-
-# Logs
-logs/
 
 examples/

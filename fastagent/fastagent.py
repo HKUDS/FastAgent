@@ -135,6 +135,10 @@ class FastAgentConfig:
     llm_timeout: float = 120.0  # LLM API call timeout in seconds
     llm_kwargs: Dict[str, Any] = field(default_factory=dict)
     
+    # Separate models for specific tasks (None = use llm_model)
+    tool_retrieval_model: Optional[str] = None  # Model for tool retrieval LLM filter
+    visual_analysis_model: Optional[str] = None  # Model for visual analysis
+    
     # Grounding Configuration
     grounding_config_path: Optional[str] = None  # If None, use default config
     workflow_config_path: Optional[str] = None  # If None, use default config_workflow.json
@@ -162,6 +166,7 @@ class FastAgentConfig:
     recording_backends: Optional[List[str]] = None  # Backends to record (None = all)
     enable_screenshot: bool = True  # Whether to enable screenshots
     enable_video: bool = True  # Whether to enable video recording
+    enable_conversation_log: bool = True  # Save LLM conversations to conversations.jsonl
     recording_log_dir: str = "./logs/recordings"  # Recording log directory
     
     # Logging Configuration
@@ -324,9 +329,20 @@ class FastAgent:
             logger.info(f"LLM Client: {self.config.llm_model} (timeout: {self.config.llm_timeout}s)")
             
             # 2. Initialize Grounding Client
+            # If custom config is provided, merge it with default configs
+            # load_config supports multiple files and deep merges them (later files override earlier ones)
             if self.config.grounding_config_path:
-                grounding_config = load_config(self.config.grounding_config_path)
+                from fastagent.config.loader import CONFIG_DIR
+                from fastagent.config.constants import CONFIG_GROUNDING, CONFIG_SECURITY
+                # Load default configs + custom config (custom values will override defaults)
+                grounding_config = load_config(
+                    CONFIG_DIR / CONFIG_GROUNDING,
+                    CONFIG_DIR / CONFIG_SECURITY,
+                    self.config.grounding_config_path
+                )
+                logger.info(f"Merged custom grounding config: {self.config.grounding_config_path}")
             else:
+                # Load default configs only
                 grounding_config = get_config()
             
             self._grounding_client = GroundingClient(config=grounding_config)
@@ -356,18 +372,21 @@ class FastAgent:
                     backends=self.config.recording_backends,
                     enable_screenshot=self.config.enable_screenshot,
                     enable_video=self.config.enable_video,
+                    enable_conversation_log=self.config.enable_conversation_log,
                     agent_name="GroundingAgent",
                     kanban=self._coordinator.kanban,  # Pass kanban for event recording
                 )
                 # Set recording manager in coordinator
                 self._coordinator.recording_manager = self._recording_manager
+                # Register to LLM client for auto-recording tool results
+                self._recording_manager.register_to_llm(self._llm_client)
                 logger.info(f"Recording: {len(self._recording_manager.backends or [])} backends")
                 logger.debug(f"  Screenshot: {self.config.enable_screenshot}, Video: {self.config.enable_video}")
             
             # 5. Initialize Agents
             # Load agent configurations from config_agents.json
             host_config = get_agent_config("HostAgent")
-            grounding_config = get_agent_config("GroundingAgent")
+            grounding_agent_config = get_agent_config("GroundingAgent")
             eval_config = get_agent_config("EvalAgent")
             
             # Host Agent
@@ -379,14 +398,42 @@ class FastAgent:
                 system_prompt=self.config.host_system_prompt,
             )
             
+            # Load GroundingAgent config values (config_agents.json values, with FastAgentConfig as fallback)
+            if grounding_agent_config:
+                grounding_backend_scope = grounding_agent_config.get("backend_scope", ["gui", "shell", "mcp", "web", "system"])
+                grounding_max_iterations = grounding_agent_config.get("max_iterations", 20)
+                visual_analysis_timeout = grounding_agent_config.get("visual_analysis_timeout", 30.0)
+                logger.info(
+                    f"Loaded GroundingAgent config from config_agents.json "
+                    f"(max_iterations={grounding_max_iterations}, visual_analysis_timeout={visual_analysis_timeout}s)"
+                )
+            else:
+                grounding_backend_scope = ["gui", "shell", "mcp", "web", "system"]
+                grounding_max_iterations = 20
+                visual_analysis_timeout = 30.0
+                logger.warning("config_agents.json not found for GroundingAgent, using defaults")
+            
+            # Create separate LLM client for tool retrieval if configured
+            tool_retrieval_llm = None
+            if self.config.tool_retrieval_model:
+                tool_retrieval_llm = LLMClient(
+                    model=self.config.tool_retrieval_model,
+                    timeout=self.config.llm_timeout,
+                    max_retries=self.config.llm_max_retries,
+                )
+                logger.info(f"Tool retrieval LLM: {self.config.tool_retrieval_model}")
+            
             # Grounding Agent
-            grounding_backend_scope = grounding_config.get("backend_scope", ["shell", "gui", "mcp"]) if grounding_config else ["shell", "gui", "mcp"]
             grounding_agent = GroundingAgent(
                 name="GroundingAgent",
                 backend_scope=grounding_backend_scope,
                 llm_client=self._llm_client,
                 coordinator=self._coordinator,
                 system_prompt=self.config.grounding_system_prompt,
+                max_iterations=grounding_max_iterations,
+                visual_analysis_timeout=visual_analysis_timeout,
+                tool_retrieval_llm=tool_retrieval_llm,
+                visual_analysis_model=self.config.visual_analysis_model,
             )
             
             # Set backend descriptions for HostAgent
@@ -822,7 +869,24 @@ class FastAgent:
             }
         
         finally:
+            # Trigger quality evolution periodically
+            await self._maybe_evolve_quality()
+            
             self._running = False
+    
+    async def _maybe_evolve_quality(self) -> None:
+        """Trigger quality evolution based on global execution count."""
+        if not self._grounding_client or not self._grounding_client.quality_manager:
+            return
+        
+        # Check if evolution should be triggered
+        if self._grounding_client.quality_manager.should_evolve():
+            try:
+                report = await self._grounding_client.evolve_quality()
+                if report.get("recommendations"):
+                    logger.info(f"Quality evolution: {report['recommendations']}")
+            except Exception as e:
+                logger.debug(f"Quality evolution skipped: {e}")
     
     def _get_workflow_stats(self) -> Dict[str, Any]:
         """Get workflow statistics"""

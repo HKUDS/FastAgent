@@ -19,10 +19,58 @@ logger = Logger.get_logger(__name__)
 
 
 def _make_shim():
+    """
+    Create a shim that wraps streamablehttp_client with improved error handling.
+    """
     @asynccontextmanager
     async def _shim(**kw):
-        async with streamablehttp_client(**kw) as (r, w, _sid_cb):
-            yield (r, w)       
+        client_streams = None
+        ctx_manager = None
+        
+        try:
+            # Enter the context - this may raise ExceptionGroup during concurrent init
+            ctx_manager = streamablehttp_client(**kw)
+            try:
+                r, w, _sid_cb = await ctx_manager.__aenter__()
+                client_streams = (r, w)
+            except Exception as conn_error:
+                # Handle connection errors during __aenter__
+                error_msg = str(conn_error).lower()
+                if "unhandled errors in a taskgroup" in error_msg:
+                    logger.debug(f"TaskGroup race condition during connection: {type(conn_error).__name__}")
+                    # Clean up and re-raise to trigger retry
+                    if ctx_manager:
+                        try:
+                            await ctx_manager.__aexit__(None, None, None)
+                        except Exception:
+                            pass  # Ignore cleanup errors
+                    raise
+                else:
+                    # Other connection errors - log and re-raise
+                    logger.warning(f"Connection error: {conn_error}")
+                    raise
+            
+            # Yield to caller
+            yield client_streams
+            
+        except GeneratorExit:
+            # Normal generator exit - this happens during cleanup
+            logger.debug("StreamableHTTP generator exit (normal cleanup)")
+            
+        finally:
+            # Always try to exit the context manager
+            if ctx_manager is not None:
+                try:
+                    await ctx_manager.__aexit__(None, None, None)
+                except (GeneratorExit, RuntimeError, OSError, Exception) as e:
+                    # Cleanup errors are expected during concurrent shutdown
+                    # Log at debug level and suppress
+                    error_type = type(e).__name__
+                    if "ExceptionGroup" in error_type or "TaskGroup" in str(e):
+                        logger.debug(f"Benign TaskGroup cleanup error: {error_type}")
+                    else:
+                        logger.debug(f"Benign cleanup error: {error_type}")
+                    
     return _shim
 
 

@@ -4,6 +4,7 @@ from .session import ShellSession
 from .transport.connector import ShellConnector
 from fastagent.config import get_config
 from fastagent.config.utils import get_config_value
+from fastagent.platform.config import get_local_server_config
 from fastagent.utils.logging import Logger
 
 logger = Logger.get_logger(__name__)
@@ -53,10 +54,19 @@ class ShellProvider(Provider[ShellSession]):
         # Load shell backend configuration
         shell_config = get_config().get_backend_config("shell")
         
+        # Get local_server config for default host and port
+        # This reads from LOCAL_SERVER_URL env var or config file
+        # Priority: connection_params > LOCAL_SERVER_URL env var > shell_config.default_port
+        local_server_config = get_local_server_config()
+        
+        # Use local_server_config['port'] as default (from LOCAL_SERVER_URL env var)
+        # This ensures OSWorld's VM port is used instead of hardcoded 5000
+        default_port = local_server_config.get('port', shell_config.default_port)
+        
         # Create connector with config parameters
         connector = ShellConnector(
-            vm_ip=get_config_value(session_config.connection_params, "vm_ip", "localhost"),
-            port=get_config_value(session_config.connection_params, "port", shell_config.default_port),
+            vm_ip=get_config_value(session_config.connection_params, "vm_ip", local_server_config['host']),
+            port=get_config_value(session_config.connection_params, "port", default_port),
             retry_times=shell_config.max_retries,
             retry_interval=shell_config.retry_interval,
             security_manager=self.security_manager

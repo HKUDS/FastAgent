@@ -2,7 +2,7 @@ import litellm
 import json
 import asyncio
 import time
-from typing import List, Sequence, Union, Dict
+from typing import List, Sequence, Union, Dict, Optional
 from dotenv import load_dotenv
 from openai.types.chat import ChatCompletionToolParam
 
@@ -11,9 +11,62 @@ from fastagent.grounding.core.tool import BaseTool
 from fastagent.utils.logging import Logger
 
 load_dotenv()
-# litellm._turn_on_debug()
+
+# Disable LiteLLM verbose logging to prevent stdout blocking with large tool schemas
+litellm.set_verbose = False
+litellm.suppress_debug_info = True
 
 logger = Logger.get_logger(__name__)
+
+
+def _sanitize_schema(params: Dict) -> Dict:
+    """Sanitize tool parameter schema to comply with Claude API requirements.
+    
+    Fixes common issues:
+    - Empty object schemas (no properties, no required)
+    - Missing required fields for Claude compatibility
+    """
+    if not params:
+        return {"type": "object", "properties": {}, "required": []}
+    
+    # Deep copy to avoid modifying the original
+    import copy
+    sanitized = copy.deepcopy(params)
+    
+    # Anthropic API requires top-level type to be 'object'
+    # If it's not an object, wrap the schema as a property of an object
+    top_level_type = sanitized.get("type")
+    if top_level_type and top_level_type != "object":
+        # Wrap non-object schema as a single property called "value"
+        logger.debug(f"[SCHEMA_SANITIZE] Wrapping non-object schema (type={top_level_type}) into object")
+        wrapped = {
+            "type": "object",
+            "properties": {
+                "value": sanitized  # The original schema becomes a property
+            },
+            "required": ["value"]  # Make it required
+        }
+        sanitized = wrapped
+    
+    # If type is object but missing properties/required, add them
+    if sanitized.get("type") == "object":
+        if "properties" not in sanitized:
+            sanitized["properties"] = {}
+        if "required" not in sanitized:
+            sanitized["required"] = []
+    
+    # Remove non-standard fields that may cause issues (like 'title')
+    sanitized.pop("title", None)
+    
+    # Recursively sanitize nested properties
+    if "properties" in sanitized and isinstance(sanitized["properties"], dict):
+        for prop_name, prop_schema in list(sanitized["properties"].items()):
+            if isinstance(prop_schema, dict):
+                # Remove title from nested properties
+                prop_schema.pop("title", None)
+    
+    return sanitized
+
 
 def _schema_to_openai(schema: ToolSchema) -> ChatCompletionToolParam:
     """Convert ToolSchema to OpenAI ChatCompletion tool format"""
@@ -22,11 +75,18 @@ def _schema_to_openai(schema: ToolSchema) -> ChatCompletionToolParam:
         "description": schema.description or "",
     }
     
-    # Only add parameters field if tool has parameters
+    # Sanitize and add parameters
     if schema.parameters:
-        function_def["parameters"] = schema.parameters
+        sanitized = _sanitize_schema(schema.parameters)
+        function_def["parameters"] = sanitized
+        # Debug: verify sanitization worked
+        if "title" in schema.parameters and "title" not in sanitized:
+            logger.debug(f"Sanitized tool '{schema.name}': removed title")
+    else:
+        # Claude requires parameters field even if empty
+        function_def["parameters"] = {"type": "object", "properties": {}, "required": []}
     
-    return {
+    return { 
         "type": "function",
         "function": function_def
     }
@@ -34,31 +94,137 @@ def _schema_to_openai(schema: ToolSchema) -> ChatCompletionToolParam:
 def _prepare_tools_for_llmclient(
     tools: List[BaseTool] | None,
     fmt: str = "openai",
-) -> Sequence[Union[ToolSchema, ChatCompletionToolParam]]:
-    """Convert BaseTool list to LLMClient usable format
+) -> tuple[Sequence[Union[ToolSchema, ChatCompletionToolParam]], Dict[str, BaseTool]]:
+    """Convert BaseTool list to LLMClient usable format, with deduplication.
     
     Args:
         tools: BaseTool instance list (should be obtained from GroundingClient and bound to runtime_info)
                 if None or empty list, return empty list
         fmt: output format, "openai" for OpenAI format
-        
-    Returns:
-        tool definition list, format depends on fmt parameter; if tools is None or empty list, return empty list
     """
     if not tools:
-        return []
+        return [], {}
     
     if fmt == "openai":
-        return [_schema_to_openai(tool.schema) for tool in tools]
-    return [tool.schema for tool in tools]
+        result = []
+        tool_map = {}  # llm_name -> BaseTool
+        name_count = {}
+        
+        for tool in tools:
+            name = tool.schema.name
+            name_count[name] = name_count.get(name, 0) + 1
+        
 
-def _tool_result_to_message(result: ToolResult, *, tool_call_id: str, tool_name: str) -> Dict:
-    """Convert ToolResult to LLMClient usable message format
+        seen_names = set()
+        for tool in tools:
+            original_name = tool.schema.name
+            
+            if name_count[original_name] > 1:
+                server_name = "unknown"
+                if tool.is_bound and tool.runtime_info and tool.runtime_info.server_name:
+                    server_name = tool.runtime_info.server_name
+                llm_name = f"{server_name}__{original_name}"
+            else:
+                llm_name = original_name
+            
+            if llm_name in seen_names:
+                logger.warning(f"[TOOL_DEDUP] Skipping duplicate tool: {llm_name}")
+                continue
+            seen_names.add(llm_name)
+            
+            tool_param = _schema_to_openai(tool.schema)
+            tool_param["function"]["name"] = llm_name 
+            result.append(tool_param)
+            
+            tool_map[llm_name] = tool
+            
+            if llm_name != original_name:
+                logger.info(f"[TOOL_RENAME] {original_name} -> {llm_name}")
+        
+        logger.info(f"[SCHEMA_SANITIZE] Prepared {len(result)} tools for LLM (from {len(tools)} total)")
+        return result, tool_map
+    
+    tool_map = {tool.schema.name: tool for tool in tools}
+    return [tool.schema for tool in tools], tool_map
+
+DEFAULT_SUMMARIZE_THRESHOLD_CHARS = 200000  # ~50K tokens, lowered from 400K to prevent context overflow
+MAX_TOOL_RESULT_CHARS = 200000  # Fallback truncation limit when summarization fails (~50K tokens)
+
+async def _summarize_tool_result(
+    content: str,
+    tool_name: str,
+    task: str = "",
+    model: str = "openrouter/anthropic/claude-sonnet-4.5",
+    timeout: float = 60.0
+) -> str:
+    """Use LLM to summarize large tool results."""
+    try:
+        logger.info(f"Summarizing tool result from '{tool_name}': {len(content):,} chars")
+        
+        # Pre-truncate if content is too large for the model (leave room for prompt + output)
+        # Assuming ~4 chars per token, 200K tokens limit, 8K output, ~500 tokens for prompt
+        # Safe input limit: (200K - 8K - 0.5K) * 4 = ~766K chars, but be conservative at 400K
+        max_input_chars = 400000
+        if len(content) > max_input_chars:
+            logger.warning(f"Pre-truncating content for summarization: {len(content):,} -> {max_input_chars:,} chars")
+            content = content[:max_input_chars] + f"\n\n[TRUNCATED for summarization: original was {len(content):,} chars]"
+        
+        task_hint = f"\n\nUser's task: {task}\nSummarize with focus on information relevant to this task." if task else ""
+        
+        prompt = f"""Tool '{tool_name}' returned a large result ({len(content):,} chars). Summarize it concisely.{task_hint}
+
+**Guidelines:**
+- Structured data (coordinates, steps, etc.): Keep key summary (totals, start/end), omit repetitive details.
+- Markup content (HTML, XML): Extract text and key data only, ignore tags/scripts.
+- Long documents: Keep structure outline and essential sections.
+- Lists/arrays: Summarize count and most relevant items.
+- Always preserve: numbers, URLs, file paths, IDs, key identifiers.
+
+Content:
+{content}
+
+Concise summary:"""
+        
+        response = await asyncio.wait_for(
+            litellm.acompletion(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                timeout=timeout
+            ),
+            timeout=timeout + 5
+        )
+        
+        summary = response.choices[0].message.content.strip()
+        result = f"[SUMMARY of {len(content):,} chars]\n{summary}"
+        
+        logger.info(f"Tool result summarized: {len(content):,} -> {len(result):,} chars")
+        return result
+        
+    except Exception as e:
+        logger.warning(f"Summarization failed for '{tool_name}': {e}")
+        return None
+
+
+async def _tool_result_to_message_async(
+    result: ToolResult, 
+    *, 
+    tool_call_id: str, 
+    tool_name: str,
+    task: str = "",
+    summarize_threshold: int = DEFAULT_SUMMARIZE_THRESHOLD_CHARS,
+    summarize_model: str = "openrouter/anthropic/claude-sonnet-4.5",
+    enable_summarization: bool = True
+) -> Dict:
+    """Convert ToolResult to LLMClient usable message format with LLM summarization for large results.
 
     Args:
         result: Tool execution result
         tool_call_id: OpenAI tool_call ID
         tool_name: Tool name
+        task: User's original task for context-aware summarization
+        summarize_threshold: If content exceeds this, use LLM summarization
+        summarize_model: Model to use for summarization
+        enable_summarization: Whether to enable LLM summarization
         
     Returns:
         OpenAI ChatCompletion tool message (text only)
@@ -71,6 +237,19 @@ def _tool_result_to_message(result: ToolResult, *, tool_call_id: str, tool_name:
             if isinstance(result.content, str)
             else json.dumps(result.content, ensure_ascii=False, default=str)
         )
+    
+    original_len = len(text_content)
+    
+    # Use LLM summarization if content exceeds threshold
+    if original_len > summarize_threshold and enable_summarization:
+        summary = await _summarize_tool_result(text_content, tool_name, task, summarize_model)
+        if summary:
+            text_content = summary
+        elif original_len > MAX_TOOL_RESULT_CHARS:
+            # Fallback: truncate if summarization failed and content is too large
+            truncate_msg = f"\n\n[TRUNCATED: Original content was {original_len:,} chars, showing first {MAX_TOOL_RESULT_CHARS:,}]"
+            text_content = text_content[:MAX_TOOL_RESULT_CHARS - len(truncate_msg)] + truncate_msg
+            logger.warning(f"Tool result truncated for '{tool_name}': {original_len:,} -> {len(text_content):,} chars (summarization failed)")
     
     return {
         "role": "tool",
@@ -88,9 +267,6 @@ async def _execute_tool_call(
     Args:
         tool: BaseTool instance (must be obtained from GroundingClient and bound to runtime_info)
         openai_tool_call: LLMClient usable tool_call object, contains id, type, function etc. fields
-        
-    Returns:
-        ToolResult execution result
     """
     if not tool.is_bound:
         raise ValueError(
@@ -103,6 +279,34 @@ async def _execute_tool_call(
     arguments = func.get("arguments", "{}")
     if isinstance(arguments, str):
         arguments = json.loads(arguments or "{}")
+    
+    # Filter out parameters that are not in the tool's schema
+    if isinstance(arguments, dict) and tool.schema.parameters:
+        # Get valid parameter names from tool schema (JSON Schema format)
+        schema_params = tool.schema.parameters
+        valid_params = set()
+        
+        if isinstance(schema_params, dict) and "properties" in schema_params:
+            valid_params = set(schema_params["properties"].keys())
+        
+        # Check for invalid parameters
+        invalid_params = []
+        for param_name in list(arguments.keys()):
+            if param_name == "skip_visual_analysis":
+                invalid_params.append(param_name)
+                continue
+            
+            # Check if parameter is in the tool's schema
+            if valid_params and param_name not in valid_params:
+                invalid_params.append(param_name)
+        
+        # Remove invalid parameters
+        for param in invalid_params:
+            arguments.pop(param)
+            logger.debug(
+                f"Removed parameter '{param}' from {tool.schema.name} "
+                f"(not in tool schema)"
+            )
 
     return await tool.invoke(
         parameters=arguments,
@@ -114,12 +318,14 @@ class LLMClient:
     """LLMClient class for single round call"""
     def __init__(
         self, 
-        model: str = "anthropic/claude-sonnet-4-5", 
+        model: str = "openrouter/anthropic/claude-sonnet-4.5", 
         enable_thinking: bool = False,
         rate_limit_delay: float = 0.0,
         max_retries: int = 3,
         retry_delay: float = 1.0,
         timeout: float = 120.0,
+        summarize_threshold_chars: int = DEFAULT_SUMMARIZE_THRESHOLD_CHARS,
+        enable_tool_result_summarization: bool = True,
         **litellm_kwargs
     ):
         """
@@ -130,6 +336,10 @@ class LLMClient:
             max_retries: Maximum number of retries on rate limit errors
             retry_delay: Initial delay between retries in seconds (exponential backoff)
             timeout: Request timeout in seconds (default: 120s)
+            summarize_threshold_chars: If tool result exceeds this threshold, use LLM to 
+                                       summarize the result (default: 200000 chars ≈ 50K tokens)
+            enable_tool_result_summarization: Whether to enable LLM-based summarization for 
+                                              large tool results (default: True)
             **litellm_kwargs: Additional litellm parameters
         """
         self.model = model
@@ -138,6 +348,8 @@ class LLMClient:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.timeout = timeout
+        self.summarize_threshold_chars = summarize_threshold_chars
+        self.enable_tool_result_summarization = enable_tool_result_summarization
         self.litellm_kwargs = litellm_kwargs
         self._logger = Logger.get_logger(__name__)
         self._last_call_time = 0.0
@@ -223,7 +435,6 @@ class LLMClient:
                         self._logger.error(f"Max retries ({self.max_retries}) reached, giving up")
                     raise
         
-        # If we get here, all retries failed
         raise last_exception
     
     async def complete(
@@ -231,26 +442,38 @@ class LLMClient:
         messages: List[Dict] | str, 
         tools: List[BaseTool] | None = None,
         execute_tools: bool = True,
-        max_iterations: int = 5,
+        summary_prompt: Optional[str] = None,
+        tool_result_callback: Optional[callable] = None,
         **kwargs
     ) -> Dict:
         """
+        Single-round LLM call with optional tool execution.
+        
         Args:
             messages: conversation history (List[Dict] for standard OpenAI format, or str for text format)
             tools: BaseTool instance list (must be obtained from GroundingClient and bound to runtime_info)
                 if None or empty list, only perform conversation, no tools
             execute_tools: if LLM returns tool_calls, whether to automatically execute tools
-            max_iterations: maximum number of tool call iterations to prevent infinite loops
+            summary_prompt: Optional custom prompt for requesting iteration summary. 
+                If provided, will request summary after tool execution.
+                If None, no summary will be requested.
+            tool_result_callback: Optional async callback to process tool results after execution.
+                Signature: async def callback(result: ToolResult, tool_name: str, tool_call: Dict, backend: str) -> ToolResult
             **kwargs: additional parameters for litellm completion
         """
         # 1. Process messages
         if isinstance(messages, str):
             current_messages = [{"role": "user", "content": messages}]
+            user_task = messages
         elif isinstance(messages, list):
             current_messages = messages.copy()
+            # Extract first user message as task for context-aware summarization
+            user_task = next(
+                (m.get("content", "") for m in messages if m.get("role") == "user"),
+                ""
+            )
         else:
             raise ValueError("messages must be List[Dict] or str")
-
         
         # 2. prepare base litellm completion kwargs
         completion_kwargs = {
@@ -259,13 +482,13 @@ class LLMClient:
         }
         
         # Add thinking/reasoning_effort only if explicitly enabled and not using tools
-        # Extended thinking has limitations when used with tools
         enable_thinking = kwargs.get("enable_thinking", self.enable_thinking)
         
-        # 2. if tools are provided, add them to the request
+        # 3. if tools are provided, add them to the request
         llm_tools = None
+        tool_map = {}  # llm_name -> BaseTool
         if tools:
-            llm_tools = _prepare_tools_for_llmclient(tools, fmt="openai")
+            llm_tools, tool_map = _prepare_tools_for_llmclient(tools, fmt="openai")
             if llm_tools:
                 completion_kwargs["tools"] = llm_tools
                 completion_kwargs["tool_choice"] = kwargs.get("tool_choice", "auto")
@@ -279,141 +502,183 @@ class LLMClient:
         if enable_thinking:
             completion_kwargs["reasoning_effort"] = kwargs.get("reasoning_effort", "medium")
         
-        # Keep track of messages for this completion
-        all_tool_results = []
-        iteration = 0
+        # 4. Apply rate limiting
+        await self._rate_limit()
         
-        while iteration < max_iterations:
-            iteration += 1
-            self._logger.info(f"LLM iteration {iteration}/{max_iterations}")
-            
-            # 3. Apply rate limiting
-            await self._rate_limit()
-            
-            # 4. Call LLM with retry logic
-            completion_kwargs["messages"] = current_messages
-            response = await self._call_with_retry(**completion_kwargs)
-            
-            # Safety check: ensure response has choices
-            if not response.choices:
-                raise ValueError("LLM response has no choices")
-            
-            response_message = response.choices[0].message
-            
-            # 5. Build assistant message
-            assistant_message = {
-                "role": "assistant",
-                "content": response_message.content or "",
-            }
-            
-            tool_calls = getattr(response_message, 'tool_calls', None)
-            if tool_calls:
-                assistant_message["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
+        # 5. Call LLM with retry (single round)
+        completion_kwargs["messages"] = current_messages
+        response = await self._call_with_retry(**completion_kwargs)
+        
+        if not response.choices:
+            raise ValueError("LLM response has no choices")
+        
+        response_message = response.choices[0].message
+        
+        # 6. Build assistant message
+        assistant_message = {
+            "role": "assistant",
+            "content": response_message.content or "",
+        }
+        
+        tool_calls = getattr(response_message, 'tool_calls', None)
+        if tool_calls:
+            assistant_message["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
                     }
-                    for tc in tool_calls
-                ]
+                }
+                for tc in tool_calls
+            ]
+        
+        # Add assistant message to conversation
+        current_messages.append(assistant_message)
+        
+        # 7. Execute tools if requested
+        tool_results = []
+        if execute_tools and tool_calls and tools:
+            self._logger.info(f"Executing {len(tool_calls)} tool calls...")
             
-            # Add assistant message to conversation
-            current_messages.append(assistant_message)
-            
-            # 6. Whether to execute tools
-            if execute_tools and tool_calls and tools:
-                self._logger.info(f"Executing {len(tool_calls)} tool calls...")
-                tool_map = {tool.schema.name: tool for tool in tools}
-                iteration_tool_results = []
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
                 
-                for tool_call in tool_calls:
-                    tool_name = tool_call.function.name
-                    
-                    # Log tool call details for visibility
+                # Extract tool metadata and check visual analysis request
+                tool_obj = tool_map.get(tool_name)
+                backend = None
+                server_name = None
+                
+                if tool_obj:
                     try:
-                        args = json.loads(tool_call.function.arguments) if isinstance(tool_call.function.arguments, str) else tool_call.function.arguments
-                        args_str = json.dumps(args, ensure_ascii=False)[:200]  # Truncate for readability
-                        self._logger.info(f"  → Calling {tool_name} with args: {args_str}")
-                    except:
+                        # Prefer runtime_info if bound
+                        if getattr(tool_obj, 'is_bound', False) and getattr(tool_obj, 'runtime_info', None):
+                            backend = tool_obj.runtime_info.backend.value
+                            server_name = tool_obj.runtime_info.server_name
+                        else:
+                            backend = tool_obj.backend_type.value if hasattr(tool_obj, 'backend_type') else None
+                    except Exception:
                         pass
+                
+                # Log tool execution
+                try:
+                    if isinstance(tool_call.function.arguments, str):
+                        safe_args_str = tool_call.function.arguments.strip() or "{}"
+                        args = json.loads(safe_args_str)
+                    else:
+                        args = tool_call.function.arguments
                     
-                    if tool_name not in tool_map:
+                    args_str = json.dumps(args, ensure_ascii=False)[:200]
+                    self._logger.info(f"Calling {tool_name} with args: {args_str}")
+                except:
+                    pass
+                
+                if tool_name not in tool_map:
+                    result = ToolResult(
+                        status=ToolStatus.ERROR,
+                        error=f"Tool '{tool_name}' not found"
+                    )
+                else:
+                    try:
+                        result = await _execute_tool_call(
+                            tool=tool_map[tool_name],
+                            openai_tool_call={
+                                "id": tool_call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call.function.name,
+                                    "arguments": tool_call.function.arguments
+                                }
+                            }
+                        )
+
+                        # Apply tool result callback if provided
+                        if tool_result_callback and not result.is_error:
+                            try:
+                                result = await tool_result_callback(
+                                    result=result,
+                                    tool_name=tool_name,
+                                    tool_call=tool_call,
+                                    backend=backend
+                                )
+                            except Exception as e:
+                                self._logger.warning(f"Tool result callback failed for {tool_name}: {e}")
+                    except Exception as e:
                         result = ToolResult(
                             status=ToolStatus.ERROR,
-                            error=f"Tool '{tool_name}' not found"
+                            error=str(e)
                         )
-                    else:
-                        try:
-                            result = await _execute_tool_call(
-                                tool=tool_map[tool_name],
-                                openai_tool_call={
-                                    "id": tool_call.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_call.function.name,
-                                        "arguments": tool_call.function.arguments
-                                    }
-                                }
-                            )
-                        except Exception as e:
-                            result = ToolResult(
-                                status=ToolStatus.ERROR,
-                                error=str(e)
-                            )
-                    
-                    tool_message = _tool_result_to_message(
-                        result, 
-                        tool_call_id=tool_call.id, 
-                        tool_name=tool_name
-                    )
-                    
-                    # Determine backend and server_name for recording
-                    backend = None
-                    server_name = None
-                    tool_obj = tool_map.get(tool_name)
-                    if tool_obj:
-                        try:
-                            # Prefer runtime_info if bound (more accurate)
-                            if getattr(tool_obj, 'is_bound', False) and getattr(tool_obj, 'runtime_info', None):
-                                backend = tool_obj.runtime_info.backend.value
-                                server_name = tool_obj.runtime_info.server_name
-                            else:
-                                backend = tool_obj.backend_type.value if hasattr(tool_obj, 'backend_type') else None
-                        except Exception:
-                            backend = None
-                            server_name = None
-                    
-                    iteration_tool_results.append({
-                        "tool_call": tool_call,
-                        "result": result,
-                        "message": tool_message,
-                        "backend": backend,
-                        "server_name": server_name,
-                    })
-                    
-                    # Add tool result message to conversation
-                    current_messages.append(tool_message)
                 
-                all_tool_results.extend(iteration_tool_results)
+                # Use async version with LLM summarization for large results
+                tool_message = await _tool_result_to_message_async(
+                    result, 
+                    tool_call_id=tool_call.id, 
+                    tool_name=tool_name,
+                    task=user_task,
+                    summarize_threshold=self.summarize_threshold_chars,
+                    summarize_model=self.model,
+                    enable_summarization=self.enable_tool_result_summarization
+                )
+                current_messages.append(tool_message)
                 
-                # Continue loop to get LLM's response with tool results
-                self._logger.info(f"Tool execution completed, continuing to iteration {iteration + 1} for LLM to process results...")
-                continue
-            else:
-                # No tool calls, we're done
-                break
+                # Store result
+                tool_results.append({
+                    "tool_call": tool_call,
+                    "result": result,
+                    "message": tool_message,
+                    "backend": backend,
+                    "server_name": server_name,
+                })
+            
+            self._logger.info(f"Tool execution completed, {len(tool_results)} tools executed")
         
-        # Return final state
+        # 8. Request summary if provided and tools were executed
+        iteration_summary = None
+        
+        if summary_prompt and tool_results:
+            self._logger.debug("Requesting iteration summary from LLM")
+            summary_message = {
+                "role": "system",
+                "content": summary_prompt
+            }
+            current_messages.append(summary_message)
+            
+            # Apply rate limiting before summary call
+            await self._rate_limit()
+            
+            # Call LLM to generate summary (without tools)
+            summary_kwargs = {
+                **self.litellm_kwargs,
+                "model": self.model,
+                "messages": current_messages,
+                "tools": [], 
+                "tool_choice": "none",
+            }
+            
+            summary_response = await self._call_with_retry(**summary_kwargs)
+            
+            if summary_response.choices:
+                summary_message = summary_response.choices[0].message
+                iteration_summary = summary_message.content or ""
+                
+                # Add summary response to messages
+                current_messages.append({
+                    "role": "assistant",
+                    "content": iteration_summary
+                })
+                
+                self._logger.debug(f"Generated iteration summary: {iteration_summary[:100]}...")
+                
+        # 9. Return single-round result        
         return {
             "message": assistant_message,
-            "tool_results": all_tool_results,
-            "messages": current_messages,  # return complete conversation history
-            "iterations": iteration
+            "tool_results": tool_results,
+            "messages": current_messages,
+            "has_tool_calls": bool(tool_calls),
+            "iteration_summary": iteration_summary
         }
-
+    
     @staticmethod
     def format_messages_to_text(messages: List[Dict]) -> str:
         """Format conversation history to readable text (for logging/debugging)"""

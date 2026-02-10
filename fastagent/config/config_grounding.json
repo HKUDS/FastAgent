@@ -4,9 +4,9 @@
     "max_retries": 3,
     "retry_interval": 3.0,
     "default_shell": "/bin/bash",
-    "working_dir": "/Users/xulingrui/Desktop/workspace/FastAgent",
+    "working_dir": null,
     "env": {},
-    "conda_env": "metachain",
+    "conda_env": null,
     "default_port": 5000
   },
   "mcp": {
@@ -16,7 +16,9 @@
     "sandbox": false,
     "auto_initialize": true,
     "eager_sessions": false,
-    "sse_read_timeout": 300.0
+    "sse_read_timeout": 300.0,
+    "check_dependencies": true,
+    "auto_install": true
   },
   "gui": {
     "timeout": 90,
@@ -29,12 +31,20 @@
   },
   "tool_search": {
     "embedding_model": "BAAI/bge-small-en-v1.5",
-    "max_tools": 300,
+    "max_tools": 40,
     "search_mode": "hybrid",
     "enable_llm_filter": true,
-    "llm_filter_threshold": 500,
+    "llm_filter_threshold": 50,
     "enable_cache_persistence": true,
-    "cache_dir": "/Users/xulingrui/Desktop/workspace/FastAgent/.fastagent/embedding_cache"
+    "cache_dir": null
+  },
+  "tool_quality": {
+    "enabled": true,
+    "enable_persistence": true,
+    "cache_dir": null,
+    "auto_evaluate_descriptions": true,
+    "enable_quality_ranking": true,
+    "evolve_interval": 5
   },
   
   "tool_cache_ttl": 600,

@@ -2,7 +2,7 @@ import datetime
 import json
 import ast
 import types
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 from fastagent.utils.logging import Logger
@@ -25,6 +25,7 @@ class RecordingManager:
         backends: Optional[List[str]] = None,
         enable_screenshot: bool = True,
         enable_video: bool = False,
+        enable_conversation_log: bool = True,
         auto_save_interval: int = 10,
         server_url: Optional[str] = None,
         kanban: Optional[Any] = None,
@@ -41,6 +42,7 @@ class RecordingManager:
                     (optional: "mcp", "gui", "shell", "system", "web")
             enable_screenshot: whether to enable screenshot (through platform.ScreenshotClient)
             enable_video: whether to enable video recording (through platform.RecordingClient)
+            enable_conversation_log: whether to save LLM conversations to conversations.jsonl (default: True)
             auto_save_interval: automatic save interval (steps)
             server_url: local server address (None = read from config/environment variables)
             kanban: Kanban instance, for real-time streaming update (optional)
@@ -52,6 +54,7 @@ class RecordingManager:
         self.backends = set(backends) if backends else {"mcp", "gui", "shell", "system", "web"}
         self.enable_screenshot = enable_screenshot
         self.enable_video = enable_video
+        self.enable_conversation_log = enable_conversation_log
         self.auto_save_interval = auto_save_interval
         self.server_url = server_url
         self.kanban = kanban
@@ -87,6 +90,148 @@ class RecordingManager:
         return cls._global_instance is not None and cls._global_instance._is_started
     
     @classmethod
+    async def record_retrieved_tools(
+        cls,
+        task_instruction: str,
+        tools: List[Any],
+        search_debug_info: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Record the tools retrieved for a task
+        
+        Args:
+            task_instruction: The task instruction used for retrieval
+            tools: List of retrieved tools
+            search_debug_info: Debug info from search (similarity scores, LLM selections)
+        """
+        instance = cls._global_instance
+        if not instance or not instance._is_started or not instance._recorder:
+            return
+        
+        # Extract tool info
+        tool_info = []
+        for tool in tools:
+            info = {
+                "name": getattr(tool, "name", str(tool)),
+            }
+            if hasattr(tool, "backend_type"):
+                info["backend"] = tool.backend_type.value if hasattr(tool.backend_type, "value") else str(tool.backend_type)
+            if hasattr(tool, "_runtime_info") and tool._runtime_info:
+                info["server_name"] = tool._runtime_info.server_name
+            tool_info.append(info)
+        
+        # Build metadata
+        metadata = {
+            "instruction": task_instruction[:500],  # Truncate long instructions
+            "count": len(tools),
+            "tools": tool_info,
+        }
+        
+        # Add search debug info if available
+        if search_debug_info:
+            metadata["search_debug"] = {
+                "search_mode": search_debug_info.get("search_mode", ""),
+                "total_candidates": search_debug_info.get("total_candidates", 0),
+                "mcp_count": search_debug_info.get("mcp_count", 0),
+                "non_mcp_count": search_debug_info.get("non_mcp_count", 0),
+                "llm_filter": search_debug_info.get("llm_filter", {}),
+                "tool_scores": search_debug_info.get("tool_scores", []),
+            }
+        
+        # Save to metadata
+        await instance._recorder.add_metadata("retrieved_tools", metadata)
+        
+        logger.info(f"Recorded {len(tools)} retrieved tools (with search debug info: {search_debug_info is not None})")
+    
+    @classmethod
+    async def record_iteration_context(
+        cls,
+        iteration: int,
+        messages_input: List[Dict[str, Any]],
+        messages_output: List[Dict[str, Any]],
+        llm_response_summary: Dict[str, Any],
+        max_content_length: int = 5000,
+    ):
+        """
+        Record a single iteration's LLM conversation to conversations.jsonl (real-time).
+        
+        Args:
+            iteration: Iteration number
+            messages_input: Messages sent to LLM
+            messages_output: Messages after LLM response  
+            llm_response_summary: Summary of LLM response
+            max_content_length: Max length for message content truncation
+        """
+        instance = cls._global_instance
+        if not instance or not instance._is_started or not instance._recorder:
+            return
+        
+        # Check if conversation recording is enabled
+        if not getattr(instance, 'enable_conversation_log', True):
+            return
+        
+        def truncate_message_content(messages: List[Dict]) -> List[Dict]:
+            """Truncate message content to avoid huge log files."""
+            result = []
+            for msg in messages:
+                new_msg = {"role": msg.get("role", "unknown")}
+                content = msg.get("content", "")
+                
+                if isinstance(content, str):
+                    if len(content) > max_content_length:
+                        new_msg["content"] = content[:max_content_length] + f"... [truncated, total {len(content)} chars]"
+                    else:
+                        new_msg["content"] = content
+                elif isinstance(content, list):
+                    # Handle multi-part content (e.g., with images)
+                    new_content = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            if item.get("type") == "image":
+                                new_content.append({"type": "image", "note": "[image data omitted]"})
+                            elif item.get("type") == "text":
+                                text = item.get("text", "")
+                                if len(text) > max_content_length:
+                                    new_content.append({
+                                        "type": "text",
+                                        "text": text[:max_content_length] + f"... [truncated, total {len(text)} chars]"
+                                    })
+                                else:
+                                    new_content.append(item)
+                            else:
+                                new_content.append(item)
+                        else:
+                            new_content.append(item)
+                    new_msg["content"] = new_content
+                else:
+                    new_msg["content"] = str(content)[:max_content_length]
+                
+                if "tool_calls" in msg:
+                    new_msg["tool_calls"] = msg["tool_calls"]
+                
+                result.append(new_msg)
+            return result
+        
+        # Build record
+        import datetime
+        record = {
+            "iteration": iteration,
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "llm_response_summary": llm_response_summary,
+            "messages_input": truncate_message_content(messages_input),
+            "messages_output": truncate_message_content(messages_output),
+        }
+        
+        # Append to conversations.jsonl (real-time)
+        conv_file = instance._recorder.trajectory_dir / "conversations.jsonl"
+        try:
+            with open(conv_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False))
+                f.write("\n")
+        except Exception as e:
+            logger.debug(f"Failed to write conversation log: {e}")
+    
+    @classmethod
     async def record_tool_execution(
         cls,
         tool_name: str,
@@ -95,6 +240,7 @@ class RecordingManager:
         result: Any,
         server_name: Optional[str] = None,
         is_success: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
     ):
         """
         Record tool execution (internal method, called by BaseTool automatically)
@@ -106,6 +252,7 @@ class RecordingManager:
             result: Tool execution result (content or error message)
             server_name: Server name for MCP backend
             is_success: Whether the tool execution was successful (default: True for backward compatibility)
+            metadata: Tool result metadata (e.g. intermediate_steps for GUI)
         """
         if not cls._global_instance or not cls._global_instance._is_started:
             return
@@ -127,15 +274,15 @@ class RecordingManager:
                 self.function = MockFunctionCall(name, arguments)
         
         class MockResult:
-            def __init__(self, content, is_success=True):
+            def __init__(self, content, is_success=True, metadata=None):
                 self.content = content
                 self.is_success = is_success
                 self.is_error = not is_success
                 self.error = content if not is_success else None
-                self.metadata = {}
+                self.metadata = metadata or {}
         
         tool_call = MockToolCall(tool_name, parameters)
-        mock_result = MockResult(result, is_success=is_success)  # Use the passed is_success parameter
+        mock_result = MockResult(result, is_success=is_success, metadata=metadata)
         
         try:
             if backend == "mcp":
@@ -460,13 +607,17 @@ class RecordingManager:
                 )
                 continue
             
+            # Extract metadata for embedding intermediate_steps (GUI)
+            result_metadata = result.metadata if hasattr(result, 'metadata') else None
+            
             await RecordingManager.record_tool_execution(
                 tool_name=tool_call.function.name,
                 backend=backend,
                 parameters=self._parse_arguments(tool_call.function.arguments),
                 result=result.content if hasattr(result, 'content') else str(result),
                 server_name=server_name,
-                is_success=result.is_success if hasattr(result, 'is_success') else True,  # Pass actual success status
+                is_success=result.is_success if hasattr(result, 'is_success') else True,
+                metadata=result_metadata,
             )
 
     async def _record_mcp(self, tool_call, result, server: str):
@@ -532,7 +683,6 @@ class RecordingManager:
                             break
         
         result_str = str(result.content) if result.is_success else str(result.error)
-        result_brief = result_str[:200] + "..." if len(result_str) > 200 else result_str
         
         is_actual_success = result.is_success
         if result.is_success:
@@ -541,16 +691,24 @@ class RecordingManager:
             has_critical_failure = any(pattern in first_200_chars for pattern in critical_failure_patterns)
             is_actual_success = not has_critical_failure
         
+        # Extract intermediate_steps from metadata for embedding in traj.jsonl
+        extra = {}
+        if hasattr(result, 'metadata') and result.metadata:
+            intermediate_steps = result.metadata.get("intermediate_steps")
+            if intermediate_steps:
+                extra["intermediate_steps"] = intermediate_steps
+        
         step_info = await self._recorder.record_step(
             backend="gui",
             tool="gui_agent",
             command=command,
             result={
                 "status": "success" if is_actual_success else "error",
-                "output": result_brief,
+                "output": result_str,
             },
             parameters=parameters,
-            auto_screenshot=self.enable_screenshot
+            auto_screenshot=self.enable_screenshot,
+            extra=extra if extra else None,
         )
         
         step_info["agent_name"] = self.agent_name
@@ -662,7 +820,6 @@ class RecordingManager:
         command = query if query else "deep_research"
         
         result_str = str(result.content) if result.is_success else str(result.error)
-        result_brief = result_str[:200] + "..." if len(result_str) > 200 else result_str
         
         is_actual_success = result.is_success
         if result.is_success and result_str:
@@ -674,7 +831,7 @@ class RecordingManager:
             command=command,
             result={
                 "status": "success" if is_actual_success else "error",
-                "output": result_brief,
+                "output": result_str,  # Full output preserved for training/replay
             },
             auto_screenshot=self.enable_screenshot
         )

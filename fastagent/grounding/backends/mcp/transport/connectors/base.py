@@ -4,6 +4,7 @@ Base connector for MCP implementations.
 This module provides the base connector interface that all MCP connectors must implement.
 """
 
+import asyncio
 from abc import abstractmethod
 from typing import Any
 
@@ -17,6 +18,10 @@ from fastagent.utils.logging import Logger
 
 logger = Logger.get_logger(__name__)
 
+# Default retry settings for tool calls
+DEFAULT_TOOL_CALL_MAX_RETRIES = 3
+DEFAULT_TOOL_CALL_RETRY_DELAY = 1.0
+
 
 class MCPBaseConnector(BaseConnector[ClientSession]):
     """Base class for MCP connectors.
@@ -24,14 +29,27 @@ class MCPBaseConnector(BaseConnector[ClientSession]):
     This class defines the interface that all MCP connectors must implement.
     """
 
-    def __init__(self, connection_manager: BaseConnectionManager[ClientSession]):
-        """Initialize base connector with common attributes."""
+    def __init__(
+        self, 
+        connection_manager: BaseConnectionManager[ClientSession],
+        tool_call_max_retries: int = DEFAULT_TOOL_CALL_MAX_RETRIES,
+        tool_call_retry_delay: float = DEFAULT_TOOL_CALL_RETRY_DELAY,
+    ):
+        """Initialize base connector with common attributes.
+        
+        Args:
+            connection_manager: The connection manager to use for the connection.
+            tool_call_max_retries: Maximum number of retries for tool calls (default: 3)
+            tool_call_retry_delay: Initial delay between retries in seconds (default: 1.0)
+        """
         super().__init__(connection_manager)
         self.client_session: ClientSession | None = None
         self._tools: list[Tool] | None = None
         self._resources: list[Resource] | None = None
         self._prompts: list[Prompt] | None = None
         self.auto_reconnect = True  # Whether to automatically reconnect on connection loss (not configurable for now)
+        self.tool_call_max_retries = tool_call_max_retries
+        self.tool_call_retry_delay = tool_call_retry_delay
 
     @property
     @abstractmethod
@@ -220,7 +238,7 @@ class MCPBaseConnector(BaseConnector[ClientSession]):
                 )
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
-        """Call an MCP tool with automatic reconnection handling.
+        """Call an MCP tool with automatic reconnection handling and retry logic.
 
         Args:
             name: The name of the tool to call.
@@ -231,23 +249,48 @@ class MCPBaseConnector(BaseConnector[ClientSession]):
 
         Raises:
             RuntimeError: If the connection is lost and cannot be reestablished.
+            Exception: If the tool call fails after all retries.
         """
+        last_error: Exception | None = None
+        
+        for attempt in range(self.tool_call_max_retries):
+            # Ensure we're connected
+            await self._ensure_connected()
 
-        # Ensure we're connected
-        await self._ensure_connected()
-
-        logger.debug(f"Calling tool '{name}' with arguments: {arguments}")
-        try:
-            result = await self.client_session.call_tool(name, arguments)
-            logger.debug(f"Tool '{name}' called with result: {result}")
-            return result
-        except Exception as e:
-            # Check if the error might be due to connection loss
-            if not self.is_connected:
-                raise RuntimeError(f"Tool call '{name}' failed due to connection loss: {e}") from e
-            else:
-                # Re-raise the original error if it's not connection-related
+            logger.debug(f"Calling tool '{name}' with arguments: {arguments} (attempt {attempt + 1}/{self.tool_call_max_retries})")
+            try:
+                result = await self.client_session.call_tool(name, arguments)
+                logger.debug(f"Tool '{name}' called successfully")
+                return result
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                
+                # Check if the error might be due to connection loss
+                if not self.is_connected:
+                    logger.warning(f"Tool call '{name}' failed due to connection loss: {e}")
+                    # Try to reconnect on next iteration
+                    continue
+                
+                # Check for retryable HTTP errors (400, 500, 502, 503, 504)
+                is_retryable = any(code in error_str for code in ['400', '500', '502', '503', '504', 'bad request', 'internal server error', 'service unavailable', 'gateway timeout'])
+                
+                if is_retryable and attempt < self.tool_call_max_retries - 1:
+                    delay = self.tool_call_retry_delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(
+                        f"Tool call '{name}' failed with retryable error: {e}, "
+                        f"retrying in {delay:.1f}s (attempt {attempt + 1}/{self.tool_call_max_retries})"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                
+                # Non-retryable error or max retries reached, re-raise
                 raise
+        
+        # All retries exhausted
+        error_msg = f"Tool call '{name}' failed after {self.tool_call_max_retries} retries"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg) from last_error
 
     async def list_tools(self) -> list[Tool]:
         """List all available tools from the MCP implementation."""

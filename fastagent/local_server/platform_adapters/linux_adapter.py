@@ -43,7 +43,7 @@ class LinuxAdapter:
                 # Import pyxcursor (should be in the same directory)
                 import sys
                 import os
-                sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+                sys.path.insert(0, os.path.dirname(__file__))
                 
                 from pyxcursor import Xcursor
                 

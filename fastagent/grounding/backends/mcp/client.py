@@ -37,6 +37,8 @@ class MCPClient:
         retry_interval: float = 2.0,
         installer: Optional[MCPInstallerManager] = None,
         check_dependencies: bool = True,
+        tool_call_max_retries: int = 3,
+        tool_call_retry_delay: float = 1.0,
     ) -> None:
         """Initialize a new MCP client.
 
@@ -51,6 +53,8 @@ class MCPClient:
             retry_interval: Wait time between retries in seconds (default: 2.0)
             installer: Optional installer manager for dependency installation
             check_dependencies: Whether to check and install dependencies (default: True)
+            tool_call_max_retries: Maximum number of retries for tool calls (default: 3)
+            tool_call_retry_delay: Initial delay between tool call retries in seconds (default: 1.0)
         """
         self.config: dict[str, Any] = {}
         self.sandbox = sandbox
@@ -61,6 +65,8 @@ class MCPClient:
         self.retry_interval = retry_interval
         self.installer = installer
         self.check_dependencies = check_dependencies
+        self.tool_call_max_retries = tool_call_max_retries
+        self.tool_call_retry_delay = tool_call_retry_delay
         self.sessions: dict[str, MCPSession] = {}
         self.active_sessions: list[str] = []
 
@@ -233,6 +239,8 @@ class MCPClient:
                     sse_read_timeout=self.sse_read_timeout,
                     installer=self.installer,
                     check_dependencies=self.check_dependencies,
+                    tool_call_max_retries=self.tool_call_max_retries,
+                    tool_call_retry_delay=self.tool_call_retry_delay,
                 )
 
                 # Create the session with proper initialization parameters

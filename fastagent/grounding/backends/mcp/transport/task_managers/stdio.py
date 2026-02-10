@@ -4,7 +4,6 @@ StdIO connection management for MCP implementations.
 This module provides a connection manager for stdio-based MCP connections
 that ensures proper task isolation and resource cleanup.
 """
-
 import asyncio
 import io
 import logging

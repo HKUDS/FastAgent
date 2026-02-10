@@ -4,7 +4,6 @@ SSE connection management for MCP implementations.
 This module provides a connection manager for SSE-based MCP connections
 that ensures proper task isolation and resource cleanup.
 """
-
 from typing import Any, Tuple
 from mcp.client.sse import sse_client
 from fastagent.utils.logging import Logger

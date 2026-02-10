@@ -5,6 +5,9 @@ from datetime import datetime
 from .tool import BaseTool
 from .transport.connectors import BaseConnector
 from .types import SessionInfo, SessionStatus, BackendType, ToolResult
+from fastagent.utils.logging import Logger
+
+logger = Logger.get_logger(__name__)
 
 
 class BaseSession(ABC):
@@ -86,6 +89,12 @@ class BaseSession(ABC):
     
     async def call_tool(self, tool_name: str, parameters=None) -> ToolResult:
         parameters = parameters or {}
+        
+        # Ensure tools are initialized before calling
+        if not self.tools:
+            logger.debug(f"Tools not initialized for session {self.session_id}, initializing now...")
+            self.session_info = await self.initialize()
+        
         tool_map = {t.schema.name: t for t in self.tools}
         if tool_name not in tool_map:
             raise ValueError(f"Unknown tool: {tool_name}")

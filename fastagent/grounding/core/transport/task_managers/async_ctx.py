@@ -32,10 +32,39 @@ class AsyncContextConnectionManager(Generic[T, P], BaseConnectionManager[T]):
     async def _establish_connection(self) -> T:
         """Create the context manager and enter it."""
         self._logger.debug("Creating context via %s", self._factory.__name__)
-        self._ctx = self._factory(*self._factory_args, **self._factory_kwargs)
-        result: T = await self._ctx.__aenter__()
-        self._logger.debug("Context %s entered successfully", self._factory.__name__)
-        return result
+        try:
+            self._ctx = self._factory(*self._factory_args, **self._factory_kwargs)
+            result: T = await self._ctx.__aenter__()
+            self._logger.debug("Context %s entered successfully", self._factory.__name__)
+            return result
+        except Exception as e:
+            # Check if this is a benign ExceptionGroup/TaskGroup error
+            # These occur during concurrent initialization and cleanup
+            error_msg = str(e).lower()
+            is_taskgroup_error = (
+                "unhandled errors in a taskgroup" in error_msg or
+                "cancel scope in a different task" in error_msg or
+                "exceptiongroup" in type(e).__name__.lower()
+            )
+            
+            if is_taskgroup_error:
+                # This is a benign race condition during concurrent connection setup
+                # Log at debug level and re-raise to trigger retry logic
+                self._logger.debug(
+                    f"Benign TaskGroup race condition during {self._factory.__name__} connection: {type(e).__name__}"
+                )
+                # Clean up the partially created context
+                if self._ctx is not None:
+                    try:
+                        await self._ctx.__aexit__(None, None, None)
+                    except Exception:
+                        pass  # Ignore cleanup errors
+                    self._ctx = None
+                raise
+            else:
+                # Real error - log at error level
+                self._logger.error(f"Error establishing connection via {self._factory.__name__}: {e}")
+                raise
 
     async def _close_connection(self) -> None:
         """Exit the context manager if it exists.

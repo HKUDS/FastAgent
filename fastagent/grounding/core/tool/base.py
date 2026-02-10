@@ -7,7 +7,7 @@ import asyncio, time, inspect
 from abc import ABC, abstractmethod
 from functools import lru_cache
 from typing import Any, ClassVar, Dict, Optional, TYPE_CHECKING
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from ..types import BackendType, ToolResult, ToolSchema, ToolStatus
 from ..exceptions import GroundingError, ErrorCode
@@ -58,6 +58,7 @@ class BaseTool(ABC):
         )
         
         self._runtime_info: Optional[ToolRuntimeInfo] = None
+        self._disable_outer_recording = True
     
     @property
     def name(self) -> str:
@@ -106,7 +107,11 @@ class BaseTool(ABC):
         if not fields:
             return {}
         
-        PModel: type[BaseModel] = create_model(f"{cls.__name__}Params", **fields) 
+        PModel: type[BaseModel] = create_model(
+            f"{cls.__name__}Params",
+            __config__=ConfigDict(arbitrary_types_allowed=True),
+            **fields
+        )
         return PModel.model_json_schema()
 
     def validate_parameters(self, params: Dict[str, Any]) -> None:
@@ -234,7 +239,11 @@ class BaseTool(ABC):
         result: ToolResult,
         execution_time: float,
     ):
-        """Auto-record tool execution (if recording is enabled)"""
+        """Auto-record tool execution to recording manager and quality manager."""
+        # Record to quality manager (for quality tracking)
+        await self._record_to_quality_manager(result, execution_time * 1000)
+        
+        # Record to recording manager (for trajectory recording)
         try:
             from fastagent.recording import RecordingManager
             
@@ -275,6 +284,22 @@ class BaseTool(ABC):
         except Exception as e:
             # Recording failure should not affect tool execution
             logger.debug(f"Failed to auto-record tool execution: {e}")
+    
+    async def _record_to_quality_manager(
+        self,
+        result: ToolResult,
+        execution_time_ms: float,
+    ):
+        """Record execution result to quality manager for quality tracking."""
+        try:
+            from fastagent.grounding.core.quality import get_quality_manager
+            
+            manager = get_quality_manager()
+            if manager:
+                await manager.record_execution(self, result, execution_time_ms)
+        except Exception as e:
+            # Quality recording failure should not affect tool execution
+            logger.debug(f"Failed to record to quality manager: {e}")
 
     # keep _run for backward-compatibility / thread-pool fallback
     def _run(self, **kwargs):

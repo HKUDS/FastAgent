@@ -7,12 +7,34 @@ logger = Logger.get_logger(__name__)
 
 def get_local_server_config() -> Dict[str, Any]:
     """
-    Read local server configuration from config file.
+    Read local server configuration.
+    
+    Priority:
+    1. Environment variable LOCAL_SERVER_URL (parsed into host/port)
+    2. Config file local_server/config.json
+    3. Defaults (127.0.0.1:5000)
     
     Returns:
-        Dict with 'host' and 'port' from server config,
-        or defaults if config not found
+        Dict with 'host' and 'port' from server config
     """
+    # Check environment variable first (for OSWorld/remote VM integration)
+    env_url = os.getenv("LOCAL_SERVER_URL")
+    if env_url:
+        try:
+            # Parse URL like "http://localhost:5000"
+            from urllib.parse import urlparse
+            parsed = urlparse(env_url)
+            host = parsed.hostname or '127.0.0.1'
+            port = parsed.port or 5000
+            logger.debug(f"Using LOCAL_SERVER_URL: {host}:{port}")
+            return {
+                'host': host,
+                'port': port,
+                'debug': False,
+            }
+        except Exception as e:
+            logger.warning(f"Failed to parse LOCAL_SERVER_URL: {e}")
+    
     # Find local_server config file
     try:
         # Try relative path from this file

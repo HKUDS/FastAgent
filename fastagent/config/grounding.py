@@ -149,7 +149,7 @@ class ToolSearchConfig(BaseModel):
     )
     cache_dir: Optional[str] = Field(
         None,
-        description="Directory for embedding cache. None means use default ~/.fastagent/embedding_cache"
+        description="Directory for embedding cache. None means use default <project_root>/.fastagent/embedding_cache"
     )
     
     @field_validator('search_mode')
@@ -159,6 +159,36 @@ class ToolSearchConfig(BaseModel):
         if v.lower() not in valid_modes:
             raise ValueError(f"Search mode must be one of {valid_modes}, got: {v}")
         return v.lower()
+
+
+class ToolQualityConfig(BaseModel):
+    """Tool quality tracking configuration"""
+    enabled: bool = Field(
+        True,
+        description="Whether to enable tool quality tracking"
+    )
+    enable_persistence: bool = Field(
+        True,
+        description="Whether to persist quality data to disk"
+    )
+    cache_dir: Optional[str] = Field(
+        None,
+        description="Directory for quality cache. None means use default <project_root>/.fastagent/tool_quality"
+    )
+    auto_evaluate_descriptions: bool = Field(
+        True,
+        description="Whether to automatically evaluate tool descriptions using LLM"
+    )
+    enable_quality_ranking: bool = Field(
+        True,
+        description="Whether to incorporate quality scores in tool ranking"
+    )
+    evolve_interval: int = Field(
+        5,
+        ge=1,
+        le=100,
+        description="Trigger quality evolution every N tool executions"
+    )
 
 
 class GroundingConfig(BaseModel):
@@ -177,6 +207,7 @@ class GroundingConfig(BaseModel):
     
     # Grounding-level settings
     tool_search: ToolSearchConfig = Field(default_factory=ToolSearchConfig)
+    tool_quality: ToolQualityConfig = Field(default_factory=ToolQualityConfig)
     
     enabled_backends: List[Dict[str, str]] = Field(
         default_factory=list,
@@ -241,5 +272,6 @@ __all__ = [
     "MCPConfig",
     "GUIConfig",
     "ToolSearchConfig",
+    "ToolQualityConfig",
     "GroundingConfig",
 ]

@@ -4,7 +4,6 @@ Sandbox connector for MCP implementations.
 This module provides a connector for communicating with MCP implementations
 that are executed inside a sandbox environment (supports any BaseSandbox implementation).
 """
-
 import asyncio
 import sys
 import time

@@ -50,13 +50,16 @@ class GroundingClient:
         # Recording manager (optional, for GUI intermediate step recording)
         self._recording_manager = recording_manager
         
+        # Tool quality manager
+        self._quality_manager = self._init_quality_manager()
+        
         # Register SystemProvider (requires GroundingClient instance, so must be done after __init__)
         self._register_system_provider()
         
     def _register_providers_from_config(self) -> None:
             """
             Based on GroundingConfig.enabled_backends, register Provider instances to
-            self._registry. Here only do *instantiation*, not await initialize()，
+            self._registry. Here only do *instantiation*, not await initialize(),
             to avoid blocking the event loop in the import stage; Provider will be lazily initialized when it is first used.
             
             Note: SystemProvider is skipped here and registered separately in _register_system_provider()
@@ -109,6 +112,82 @@ class GroundingClient:
             self._logger.debug("SystemProvider registered successfully")
         except Exception as e:
             self._logger.warning(f"Failed to register SystemProvider: {e}")
+    
+    def _init_quality_manager(self):
+        """Initialize tool quality manager based on config."""
+        try:
+            # Check if quality tracking is enabled in config
+            quality_config = getattr(self._config, 'tool_quality', None)
+            if not quality_config or not getattr(quality_config, 'enabled', True):
+                self._logger.debug("Tool quality tracking disabled")
+                return None
+            
+            from .quality import ToolQualityManager, set_quality_manager
+            from pathlib import Path
+            
+            cache_dir = getattr(quality_config, 'cache_dir', None)
+            if cache_dir:
+                cache_dir = Path(cache_dir)
+            
+            manager = ToolQualityManager(
+                cache_dir=cache_dir,
+                enable_persistence=getattr(quality_config, 'enable_persistence', True),
+                auto_save=True,
+                evolve_interval=getattr(quality_config, 'evolve_interval', 5),
+            )
+            
+            # Set as global manager for BaseTool access
+            set_quality_manager(manager)
+            
+            self._logger.info(
+                f"ToolQualityManager initialized "
+                f"(records={len(manager._records)})"
+            )
+            return manager
+            
+        except Exception as e:
+            self._logger.warning(f"Failed to initialize ToolQualityManager: {e}")
+            return None
+    
+    @property
+    def quality_manager(self):
+        """Get the tool quality manager."""
+        return self._quality_manager
+    
+    # Quality API for Upper Layer
+    def get_quality_report(self) -> Dict[str, Any]:
+        """
+        Get comprehensive tool quality report.
+        """
+        if not self._quality_manager:
+            return {"status": "disabled", "message": "Quality tracking not enabled"}
+        return self._quality_manager.get_quality_report()
+    
+    async def evolve_quality(self) -> Dict[str, Any]:
+        """
+        Run quality self-evolution cycle.
+        
+        This triggers:
+        - Tool change detection
+        - Description re-evaluation for updated tools
+        - Adaptive quality weight computation
+        
+        Call this periodically or after tool set changes.
+        """
+        if not self._quality_manager:
+            return {"status": "disabled"}
+        
+        # Get all tools
+        all_tools = await self.list_tools()
+        return await self._quality_manager.evolve(all_tools)
+    
+    def get_tool_insights(self, tool: BaseTool) -> Dict[str, Any]:
+        """
+        Get detailed quality insights for a specific tool.
+        """
+        if not self._quality_manager:
+            return {"status": "disabled"}
+        return self._quality_manager.get_tool_insights(tool)
 
     def register_provider(self, provider: Provider) -> None:
         self._registry.register(provider)
@@ -377,10 +456,10 @@ class GroundingClient:
         """
         List tools from backend(s) or session.
         
-        1. session_name is provided → return tools from that session
-        2. backend is list → return tools from multiple backends
-        3. backend is single → return tools from that backend
-        4. backend is None → return tools from all backends
+        1. session_name is provided -> return tools from that session
+        2. backend is list -> return tools from multiple backends
+        3. backend is single -> return tools from that backend
+        4. backend is None -> return tools from all backends
         
         Args:
             backend: Single backend, list of backends, or None for all
@@ -449,6 +528,17 @@ class GroundingClient:
         backend = self._session_info[session_name].backend_type
         return await self.list_tools(backend, session_name, use_cache)
 
+    async def list_all_backend_tools(
+        self,
+        use_cache: bool = False
+    ) -> Dict[BackendType, list[BaseTool]]:
+        """List static tools for every registered backend."""
+        result = {}
+        for backend_type in self.list_providers().keys():
+            tools = await self.list_backend_tools(backend=backend_type, use_cache=use_cache)
+            result[backend_type] = tools
+        return result
+
     async def search_tools(
         self,
         task_description: str,
@@ -492,6 +582,10 @@ class GroundingClient:
         
         # lazy initialize SearchCoordinator (or recreate if parameters changed)
         if self._search_coordinator is None:
+            # Get quality ranking settings from config
+            quality_config = getattr(self._config, 'tool_quality', None)
+            enable_quality_ranking = getattr(quality_config, 'enable_quality_ranking', True) if quality_config else True
+            
             self._search_coordinator = SearchCoordinator(
                 max_tools=max_tools,
                 llm=llm_callable,
@@ -499,6 +593,8 @@ class GroundingClient:
                 llm_filter_threshold=llm_filter_threshold,
                 enable_cache_persistence=enable_cache_persistence,
                 cache_dir=cache_dir,
+                quality_manager=self._quality_manager,
+                enable_quality_ranking=enable_quality_ranking,
             )
         
         # execute search and sort
@@ -515,6 +611,16 @@ class GroundingClient:
             # fallback: return top N tools
             fallback_max = max_tools or self._config.tool_search.max_tools
             return candidate_tools[:fallback_max]
+    
+    def get_last_search_debug_info(self) -> Optional[Dict[str, Any]]:
+        """Get debug info from the last tool search operation.
+        
+        Returns:
+            Dict containing search debug info, or None if no search has been performed.
+        """
+        if self._search_coordinator is None:
+            return None
+        return self._search_coordinator.get_last_search_debug_info()
     
     async def get_tools_with_auto_search(
         self,
@@ -593,7 +699,7 @@ class GroundingClient:
         
         # Determine max_tools from config if not provided
         if max_tools is None:
-            max_tools = get_config_value(self._config, "tool_search.max_tools", 300)
+            max_tools = self._config.tool_search.max_tools
         
         # Decide whether search is needed
         tools_count = len(all_tools)
@@ -759,8 +865,10 @@ class GroundingClient:
         
         # Execute the tool
         # Ensure session exists (except for SYSTEM backend which doesn't use sessions)
-        if not runtime_session and runtime_backend != BackendType.SYSTEM:
-            runtime_session = await self.ensure_session(runtime_backend, runtime_server)
+        # Check if session really exists - cached tools have session_name but session may not be running
+        if runtime_backend != BackendType.SYSTEM:
+            if not runtime_session or runtime_session not in self._sessions:
+                runtime_session = await self.ensure_session(runtime_backend, runtime_server)
         
         try:
             provider = self._registry.get(runtime_backend)

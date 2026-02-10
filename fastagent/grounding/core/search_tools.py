@@ -1,9 +1,11 @@
+from fastagent.grounding.core.tool.base import BaseTool
 import re
+import os
 import numpy as np
-from typing import Iterable, List, Tuple, Dict, Optional, Any
+import httpx
+from typing import Iterable, List, Tuple, Dict, Optional, Any, TYPE_CHECKING
 from enum import Enum
 import json
-import hashlib
 import pickle
 from pathlib import Path
 from datetime import datetime
@@ -12,6 +14,10 @@ from .tool import BaseTool
 from .types import BackendType
 from fastagent.llm import LLMClient
 from fastagent.utils.logging import Logger
+from fastagent.config.constants import PROJECT_ROOT
+
+if TYPE_CHECKING:
+    from .quality import ToolQualityManager
 
 logger = Logger.get_logger(__name__)
 
@@ -38,10 +44,19 @@ class ToolRanker:
         """Initialize ToolRanker.
         
         Args:
-            model_name: Embedding model name. If None, will use the value from config.
-            cache_dir: Directory to store persistent embedding cache. If None, uses ~/.fastagent/embedding_cache
-            enable_cache_persistence: Whether to persist embeddings to disk. Default: False (memory only)
+            model_name: Embedding model name. If None, will use env or config value.
+            cache_dir: Directory to store persistent embedding cache.
+            enable_cache_persistence: Whether to persist embeddings to disk.
         """
+        # Check for remote API config from environment
+        self._api_base_url = os.getenv("EMBEDDING_BASE_URL")
+        self._api_key = os.getenv("EMBEDDING_API_KEY")
+        self._use_remote_api = bool(self._api_key and self._api_base_url)
+        
+        # Get model name: env > param > config > default
+        if model_name is None:
+            model_name = os.getenv("EMBEDDING_MODEL")
+        
         if model_name is None:
             try:
                 from fastagent.config import get_config
@@ -55,10 +70,13 @@ class ToolRanker:
         self._embed_model = None  # lazy load
         self._embedding_fn = None
         
+        if self._use_remote_api:
+            logger.info(f"Using remote embedding API: {self._api_base_url}, model: {model_name}")
+        
         # Persistent cache settings
         self._enable_cache_persistence = enable_cache_persistence
         if cache_dir is None:
-            cache_dir = Path.home() / ".fastagent" / "embedding_cache"
+            cache_dir = PROJECT_ROOT / ".fastagent" / "embedding_cache"
         self._cache_dir = Path(cache_dir)
         
         # Log cache settings
@@ -236,8 +254,40 @@ class ToolRanker:
         return result
 
     def _ensure_model(self) -> bool:
-        if self._embed_model:
+        """Ensure embedding model is ready (local or remote)."""
+        if self._embedding_fn is not None:
             return True
+        
+        if self._use_remote_api:
+            return self._init_remote_embedding()
+        return self._init_local_embedding()
+
+    def _init_remote_embedding(self) -> bool:
+        """Initialize remote embedding API (OpenRouter/OpenAI compatible)."""
+        try:
+            def embed_texts(texts: List[str]) -> List[np.ndarray]:
+                with httpx.Client(timeout=60.0) as client:
+                    response = client.post(
+                        f"{self._api_base_url}/embeddings",
+                        headers={
+                            "Authorization": f"Bearer {self._api_key}",
+                            "Content-Type": "application/json"
+                        },
+                        json={"model": self._model_name, "input": texts}
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    return [np.array(item["embedding"]) for item in data["data"]]
+            
+            self._embedding_fn = embed_texts
+            logger.info(f"Remote embedding API initialized: {self._model_name}")
+            return True
+        except Exception as exc:
+            logger.error(f"Failed to initialize remote embedding API: {exc}")
+            return False
+
+    def _init_local_embedding(self) -> bool:
+        """Initialize local fastembed model."""
         try:
             from fastembed import TextEmbedding 
             logger.debug(f"fastembed imported successfully, loading model: {self._model_name}")
@@ -458,9 +508,68 @@ class ToolRanker:
         return cleared_count
 
 
+class SearchDebugInfo:
+    """Debug information from tool search process."""
+    
+    def __init__(self):
+        self.search_mode: str = ""
+        self.total_candidates: int = 0
+        self.mcp_count: int = 0
+        self.non_mcp_count: int = 0
+        
+        # LLM filter info
+        self.llm_filter_used: bool = False
+        self.llm_brief_plan: str = ""
+        self.llm_utility_tools: Dict[str, List[str]] = {}  # server -> tool names
+        self.llm_domain_servers: List[str] = []
+        self.llm_utility_count: int = 0
+        self.llm_domain_count: int = 0
+        
+        # Semantic search scores
+        self.tool_scores: List[Dict[str, Any]] = []  # [{name, server, score, selected}]
+        
+        # Final selected tools
+        self.selected_tools: List[Dict[str, Any]] = []  # [{name, server, backend}]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "search_mode": self.search_mode,
+            "total_candidates": self.total_candidates,
+            "mcp_count": self.mcp_count,
+            "non_mcp_count": self.non_mcp_count,
+            "llm_filter": {
+                "used": self.llm_filter_used,
+                "brief_plan": self.llm_brief_plan,
+                "utility_tools": self.llm_utility_tools,
+                "domain_servers": self.llm_domain_servers,
+                "utility_count": self.llm_utility_count,
+                "domain_count": self.llm_domain_count,
+            },
+            "tool_scores": self.tool_scores,
+            "selected_tools": self.selected_tools,
+        }
+
+
 class SearchCoordinator(BaseTool):
     _name = "_filter_tools"
     _description = "Internal helper: filter & rank tools from a given list."
+    
+    # Fallback defaults when config loading fails
+    DEFAULT_MAX_TOOLS: int = 20
+    DEFAULT_LLM_FILTER: bool = True
+    DEFAULT_LLM_THRESHOLD: int = 50
+    DEFAULT_CACHE_PERSISTENCE: bool = False
+    DEFAULT_SEARCH_MODE: str = "hybrid"
+
+    @classmethod
+    def get_parameters_schema(cls) -> Dict[str, Any]:
+        """Override to avoid JSON schema generation for list[BaseTool] parameter.
+        
+        The _arun method uses `candidate_tools: list[BaseTool]` which cannot be
+        converted to JSON Schema because BaseTool is an ABC class, not a Pydantic model.
+        Since this is an internal tool, we return an empty schema.
+        """
+        return {}
 
     def __init__(
         self,
@@ -471,6 +580,8 @@ class SearchCoordinator(BaseTool):
         llm_filter_threshold: Optional[int] = None,
         enable_cache_persistence: Optional[bool] = None,
         cache_dir: Optional[str | Path] = None,
+        quality_manager: Optional["ToolQualityManager"] = None,
+        enable_quality_ranking: bool = True,
     ):
         """Create a SearchCoordinator.
 
@@ -486,27 +597,31 @@ class SearchCoordinator(BaseTool):
         """
         super().__init__()
         
-        # Load configuration with fallback to defaults
+        # Load config (may be None if loading fails)
+        tool_search_config = None
         try:
             from fastagent.config import get_config
-            config = get_config()
-            
-            # Read from config if not provided
-            max_tools = max_tools if max_tools is not None else config.tool_search.max_tools
-            enable_llm_filter = enable_llm_filter if enable_llm_filter is not None else config.tool_search.enable_llm_filter
-            llm_filter_threshold = llm_filter_threshold if llm_filter_threshold is not None else getattr(config.tool_search, 'llm_filter_threshold', 50)
-            enable_cache_persistence = enable_cache_persistence if enable_cache_persistence is not None else getattr(config.tool_search, 'enable_cache_persistence', False)
-            cache_dir = cache_dir if cache_dir is not None else getattr(config.tool_search, 'cache_dir', None)
-            self._default_mode = config.tool_search.search_mode
+            tool_search_config = getattr(get_config(), 'tool_search', None)
         except Exception as exc:
-            logger.warning(f"Failed to load config, using defaults: {exc}")
-            max_tools = max_tools if max_tools is not None else 20
-            enable_llm_filter = enable_llm_filter if enable_llm_filter is not None else True
-            llm_filter_threshold = llm_filter_threshold if llm_filter_threshold is not None else 50
-            enable_cache_persistence = enable_cache_persistence if enable_cache_persistence is not None else False
-            self._default_mode = "hybrid"
+            logger.warning(f"Failed to load config: {exc}")
         
-        self.max_tools = max_tools
+        def resolve(user_value, config_attr: str, default):
+            """Priority: user_value -> config -> default"""
+            if user_value is not None:
+                return user_value
+            if tool_search_config is not None:
+                config_value = getattr(tool_search_config, config_attr, None)
+                if config_value is not None:
+                    return config_value
+            return default
+        
+        # Resolve each setting with priority: user -> config -> default
+        self.max_tools = resolve(max_tools, 'max_tools', self.DEFAULT_MAX_TOOLS)
+        enable_llm_filter = resolve(enable_llm_filter, 'enable_llm_filter', self.DEFAULT_LLM_FILTER)
+        llm_filter_threshold = resolve(llm_filter_threshold, 'llm_filter_threshold', self.DEFAULT_LLM_THRESHOLD)
+        enable_cache_persistence = resolve(enable_cache_persistence, 'enable_cache_persistence', self.DEFAULT_CACHE_PERSISTENCE)
+        cache_dir = resolve(cache_dir, 'cache_dir', None)
+        self._default_mode = resolve(None, 'search_mode', self.DEFAULT_SEARCH_MODE)
         
         # Log cache settings for debugging
         logger.info(
@@ -518,11 +633,18 @@ class SearchCoordinator(BaseTool):
             enable_cache_persistence=enable_cache_persistence,
             cache_dir=cache_dir
         )
-        self._llm: LLMClient = llm
+        self._llm: LLMClient | None = llm if llm is not None else LLMClient()
         
         # LLM filter settings
         self._enable_llm_filter = enable_llm_filter
         self._llm_filter_threshold = llm_filter_threshold
+        
+        # Quality-aware ranking settings
+        self._quality_manager = quality_manager
+        self._enable_quality_ranking = enable_quality_ranking
+        
+        # Debug info from last search
+        self._last_search_debug_info: Optional[SearchDebugInfo] = None
 
     async def _arun(
         self,
@@ -535,224 +657,359 @@ class SearchCoordinator(BaseTool):
         max_tools = self.max_tools if max_tools is None else max_tools
         mode = self._default_mode if mode is None else mode
 
+        # Initialize debug info
+        debug_info = SearchDebugInfo()
+        debug_info.search_mode = mode
+        debug_info.total_candidates = len(candidate_tools)
+        self._last_search_debug_info = debug_info
+
+        # Cache check
         cache_key = (id(candidate_tools), task_prompt, mode, max_tools)
         if not hasattr(self, "_query_cache"):
             self._query_cache: Dict[tuple, list[BaseTool]] = {}
         if cache_key in self._query_cache:
             return self._query_cache[cache_key]
 
-        if len(candidate_tools) <= max_tools:
-            self._query_cache[cache_key] = candidate_tools
-            return candidate_tools
+        # Split MCP tools and non-MCP tools
+        # Non-MCP tools (shell, gui, web, etc.) are always included, skip all filtering
+        mcp_tools = []
+        non_mcp_tools = []
+        
+        for t in candidate_tools:
+            if t.is_bound:
+                backend = t.runtime_info.backend.value
+            else:
+                backend = t.backend_type.value if t.backend_type else "UNKNOWN"
+            
+            if backend.lower() == "mcp":
+                mcp_tools.append(t)
+            else:
+                non_mcp_tools.append(t)
+        
+        debug_info.mcp_count = len(mcp_tools)
+        debug_info.non_mcp_count = len(non_mcp_tools)
+        logger.info(f"Tool split: {len(mcp_tools)} MCP, {len(non_mcp_tools)} non-MCP (always included)")
+        
+        # If MCP tools within limit, return all
+        if len(mcp_tools) <= max_tools:
+            result = mcp_tools + non_mcp_tools
+            self._query_cache[cache_key] = result
+            self._populate_selected_tools(debug_info, result)
+            return result
 
-        # Decide whether to use LLM filter based on tool count and threshold
-        tools_count = len(candidate_tools)
+        mcp_count = len(mcp_tools)
         should_use_llm_filter = (
             self._llm and 
             self._enable_llm_filter and 
-            tools_count > self._llm_filter_threshold
+            mcp_count > self._llm_filter_threshold
         )
         
+        # Path 1: LLM pre-filter (large MCP tool set)
         if should_use_llm_filter:
-            logger.info(
-                f"Tool count ({tools_count}) > threshold ({self._llm_filter_threshold}), "
-                f"applying LLM pre-filter..."
-            )
-            shortlist = await self._llm_filter(task_prompt, candidate_tools)
+            logger.info(f"Path 1: MCP count ({mcp_count}) > threshold, using LLM filter...")
+            debug_info.llm_filter_used = True
             
-            # If LLM filter returned empty list, use all candidates
-            if not shortlist:
-                logger.warning("LLM filter returned empty list, using all candidate tools")
-                shortlist = candidate_tools
-        else:
-            if not self._enable_llm_filter:
-                logger.debug("LLM filter disabled, using all candidate tools")
-            else:
-                logger.debug(
-                    f"Tool count ({tools_count}) <= threshold ({self._llm_filter_threshold}), "
-                    f"skipping LLM filter"
-                )
-            shortlist = candidate_tools
-
-        try:
-            ranked = self._ranker.rank(task_prompt, shortlist, top_k=max_tools, mode=SearchMode(mode))
-            result = [t for t, _ in ranked]
-        except Exception as exc:
-            import traceback
-            logger.warning("Ranking failed (%s), falling back to keyword search", exc)
-            logger.debug("Ranking error traceback:\n%s", traceback.format_exc())
             try:
-                result = [t for t, _ in self._ranker._keyword_search(task_prompt, shortlist, max_tools)]
-            except Exception as fallback_exc:
-                logger.error("Keyword search also failed (%s), returning top N tools", fallback_exc)
-                logger.debug("Keyword search error traceback:\n%s", traceback.format_exc())
-                result = shortlist[:max_tools]
-
-        # Log search results for user visibility
-        self._log_search_results(candidate_tools, result, mode)
+                utility_tools, domain_tools, llm_filter_info = await self._llm_filter_with_planning(
+                    task_prompt, mcp_tools
+                )
+                
+                # Record LLM filter results
+                debug_info.llm_brief_plan = llm_filter_info.get("brief_plan", "")
+                debug_info.llm_utility_tools = llm_filter_info.get("utility_tools", {})
+                debug_info.llm_domain_servers = llm_filter_info.get("domain_servers", [])
+                
+                utility_count = len(utility_tools)
+                domain_count = len(domain_tools)
+                debug_info.llm_utility_count = utility_count
+                debug_info.llm_domain_count = domain_count
+                total_count = utility_count + domain_count
+                
+                if total_count <= max_tools:
+                    mcp_result = utility_tools + domain_tools
+                else:
+                    # Exceeds limit: keep utility, search domain
+                    domain_quota = max(max_tools - utility_count, 5)
+                    logger.info(
+                        f"Total ({total_count}) > max_tools ({max_tools}), "
+                        f"keeping {utility_count} utility, searching {domain_count} domain (quota: {domain_quota})"
+                    )
+                    
+                    # Compute scores for utility tools (marked as LLM-selected)
+                    if utility_tools:
+                        utility_ranked = self._ranker.rank(
+                            task_prompt, utility_tools,
+                            top_k=len(utility_tools), mode=SearchMode(mode)
+                        )
+                        self._record_tool_scores(debug_info, utility_ranked, is_selected=True)
+                    
+                    if domain_tools:
+                        # Rank all domain tools to see all scores for debugging
+                        all_domain_ranked = self._ranker.rank(
+                            task_prompt, domain_tools, 
+                            top_k=len(domain_tools), mode=SearchMode(mode)
+                        )
+                        # Save scores for all domain tools (mark which ones are selected)
+                        for i, (tool, score) in enumerate(all_domain_ranked):
+                            server_name = None
+                            if tool.is_bound and tool.runtime_info:
+                                server_name = tool.runtime_info.server_name
+                            debug_info.tool_scores.append({
+                                "name": tool.name,
+                                "server": server_name,
+                                "score": round(score, 4),
+                                "selected": i < domain_quota,
+                            })
+                        searched_domain = [t for t, _ in all_domain_ranked[:domain_quota]]
+                    else:
+                        searched_domain = []
+                    
+                    mcp_result = utility_tools + searched_domain
+                
+            except Exception as exc:
+                logger.warning(f"LLM filter failed ({exc}), fallback to direct ranking")
+                ranked = self._ranker.rank(task_prompt, mcp_tools, top_k=max_tools, mode=SearchMode(mode))
+                self._record_tool_scores(debug_info, ranked, is_selected=True)
+                mcp_result = [t for t, _ in ranked]
         
+        # Path 2: Plan-enhanced search (small MCP tool set)
+        else:
+            logger.info(f"Path 2: MCP count ({mcp_count}) <= threshold, using enhanced search...")
+            debug_info.llm_filter_used = False
+            
+            if self._llm:
+                try:
+                    enhanced_query = await self._generate_search_query(task_prompt)
+                except Exception:
+                    enhanced_query = task_prompt
+            else:
+                enhanced_query = task_prompt
+            
+            try:
+                ranked = self._ranker.rank(
+                    enhanced_query, mcp_tools, 
+                    top_k=max_tools, mode=SearchMode(mode)
+                )
+                # Record all scores from semantic search
+                self._record_tool_scores(debug_info, ranked, is_selected=True)
+                mcp_result = [t for t, _ in ranked]
+            except Exception:
+                ranked = self._ranker._keyword_search(
+                    enhanced_query, mcp_tools, max_tools
+                )
+                self._record_tool_scores(debug_info, ranked, is_selected=True)
+                mcp_result = [t for t, _ in ranked]
+
+        # Apply quality ranking on MCP results
+        if self._enable_quality_ranking and self._quality_manager and mcp_result:
+            try:
+                ranked_with_scores = [(t, 1.0) for t in mcp_result]
+                ranked_with_scores = self._quality_manager.adjust_ranking(ranked_with_scores)
+                mcp_result = [t for t, _ in ranked_with_scores]
+            except Exception:
+                pass
+
+        # Limit MCP tools, then combine with non-MCP tools
+        mcp_result = mcp_result[:max_tools]
+        result = mcp_result + non_mcp_tools
+        
+        # Populate final selected tools in debug info
+        self._populate_selected_tools(debug_info, result)
+        
+        self._log_search_results(candidate_tools, result, mode)
         self._query_cache[cache_key] = result
         return result
-
-    async def _llm_filter(self, prompt: str, tools: list[BaseTool]) -> list[BaseTool]:
-        """
-        Let LLM judge which backend/server based on actual tool capabilities.
-        Shows representative tool examples to help LLM understand what each server does.
-        """
-        # Group tools by backend and server
-        from collections import defaultdict
-        backend_server_tools: Dict[str, Dict[str | None, list[BaseTool]]] = defaultdict(lambda: defaultdict(list))
-        
-        for t in tools:
-            # Get backend and server info
-            if t.is_bound:
-                backend = t.runtime_info.backend.value
-                server = t.runtime_info.server_name if backend.lower() == "mcp" else None
-            else:
-                if not t.backend_type or t.backend_type == BackendType.NOT_SET:
-                    logger.warning(f"Tool {t.name} has no backend info, skipping in LLM filter")
-                    continue
-                backend = t.backend_type.value
-                server = None
+    
+    def _record_tool_scores(
+        self, 
+        debug_info: SearchDebugInfo, 
+        ranked: List[Tuple[BaseTool, float]], 
+        is_selected: bool = False
+    ) -> None:
+        """Record tool scores from ranking results."""
+        for tool, score in ranked:
+            server_name = None
+            if tool.is_bound and tool.runtime_info:
+                server_name = tool.runtime_info.server_name
             
-            backend_server_tools[backend][server].append(t)
+            debug_info.tool_scores.append({
+                "name": tool.name,
+                "server": server_name,
+                "score": round(score, 4),
+                "selected": is_selected,
+            })
+    
+    def _populate_selected_tools(
+        self, 
+        debug_info: SearchDebugInfo, 
+        tools: List[BaseTool]
+    ) -> None:
+        """Populate selected tools in debug info."""
+        for tool in tools:
+            backend = "UNKNOWN"
+            server_name = None
+            
+            if tool.is_bound and tool.runtime_info:
+                backend = tool.runtime_info.backend.value
+                server_name = tool.runtime_info.server_name
+            elif tool.backend_type:
+                backend = tool.backend_type.value
+            
+            debug_info.selected_tools.append({
+                "name": tool.name,
+                "server": server_name,
+                "backend": backend,
+            })
 
-        # Build information block with all tool names and some descriptions
-        lines: list[str] = ["Available backends and their tools:"]
+    async def _llm_filter_with_planning(
+        self, 
+        task_prompt: str, 
+        tools: list[BaseTool]
+    ) -> tuple[list[BaseTool], list[BaseTool], Dict[str, Any]]:
+        """
+        LLM pre-filter for MCP servers.
+        Returns (utility_tools, domain_tools, llm_filter_info).
+        """
+        from collections import defaultdict
+        
+        # Group tools by server name
+        server_tools: Dict[str, list[BaseTool]] = defaultdict(list)
+        for t in tools:
+            if t.is_bound and t.runtime_info:
+                server = t.runtime_info.server_name or "default"
+            else:
+                server = "unknown"
+            server_tools[server].append(t)
+
+        # Build tool name -> tool object mapping
+        tool_name_map: Dict[str, BaseTool] = {t.name: t for t in tools}
+
+        # Build server description with tool names
+        lines: list[str] = ["Available MCP servers:"]
         lines.append("")
         
-        for backend, srv_map in backend_server_tools.items():
-            total = sum(len(tool_list) for tool_list in srv_map.values())
-            lines.append(f"## {backend} Backend ({total} tools)")
-
-            if backend.lower() == "mcp":
-                # For MCP, show each server with all tool names and some descriptions
-                for srv, tool_list in srv_map.items():
-                    srv_display = srv or "<default>"
-                    lines.append(f"\n### Server: {srv_display} ({len(tool_list)} tools)")
-                    
-                    # Show all tool names
-                    tool_names = [t.name for t in tool_list]
-                    lines.append(f"  All tools: {', '.join(tool_names)}")
-                    
-                    # Show up to 5 tool descriptions as examples
-                    if tool_list:
-                        lines.append(f"  Example capabilities:")
-                        examples = tool_list[:5]
-                        for tool in examples:
-                            tool_desc = tool.description or "No description"
-                            # Truncate long descriptions
-                            if len(tool_desc) > 100:
-                                tool_desc = tool_desc[:97] + "..."
-                            lines.append(f"    - {tool.name}: {tool_desc}")
-            else:
-                # For non-MCP backends, show all tool names and some descriptions
-                for srv, tool_list in srv_map.items():
-                    tool_names = [t.name for t in tool_list]
-                    lines.append(f"  All tools: {', '.join(tool_names)}")
-                    
-                    # Show up to 5 tool descriptions as examples
-                    if tool_list:
-                        lines.append(f"  Example capabilities:")
-                        examples = tool_list[:5]
-                        for tool in examples:
-                            tool_desc = tool.description or "No description"
-                            if len(tool_desc) > 100:
-                                tool_desc = tool_desc[:97] + "..."
-                            lines.append(f"    - {tool.name}: {tool_desc}")
-            
+        for server, tool_list in server_tools.items():
+            lines.append(f"### Server: {server} ({len(tool_list)} tools)")
+            tool_names = [t.name for t in tool_list]
+            lines.append(f"  All tools: {', '.join(tool_names)}")
+            if tool_list:
+                lines.append(f"  Example capabilities:")
+                for tool in tool_list[:5]:
+                    tool_desc = tool.description or "No description"
+                    if len(tool_desc) > 100:
+                        tool_desc = tool_desc[:97] + "..."
+                    lines.append(f"    - {tool.name}: {tool_desc}")
             lines.append("")
 
-        capabilities_block = "\n".join(lines)
+        servers_block = "\n".join(lines)
 
-        # Build conversation history with system prompt
         TOOL_FILTER_SYSTEM_PROMPT = f"""You are an expert tool selection assistant.
 
 # Your task
-Analyze the given task and determine which backend(s) and server(s) provide the capabilities needed.
+Analyze the given task and determine which MCP servers and tools are needed.
+Think about how you would accomplish this task step by step, then classify needed servers and tools.
 
 # Important guidelines
-- **Focus on tool names and capabilities**: Carefully examine the tool names listed below to understand what each backend/server can do
-- **Be inclusive**: If a backend/server has tools that might be relevant, include it
-- **When in doubt, include it**: It's better to include a backend/server than miss relevant tools
-- **Consider tool names as hints**: Tool names often indicate their functionality (e.g., "create_file", "search_web", "read_calendar")
+- **Focus on tool names and capabilities**: Carefully examine the tool names to understand what each server can do
+- **Be inclusive for domain servers**: If a server has tools that might be relevant to the core task, include it
+- **Be precise for utility tools**: Only select the specific auxiliary tools needed (e.g., file save, time query)
+- **When in doubt, include in domain_servers**: It's better to include a server than miss relevant tools
 
-{capabilities_block}
+{servers_block}
 
 # Output format
-Return ONLY a JSON array (no markdown, no explanation):
-[{{"backend": "...", "server": "..."}}, ...]
+Return ONLY a JSON object (no markdown, no explanation):
+{{
+  "brief_plan": "1-2 sentence execution plan",
+  "utility_tools": {{
+    "server1": ["tool1", "tool2"]
+  }},
+  "domain_servers": ["server2", "server3"]
+}}
 
-For non-MCP backends, set "server" to null.
-If unsure, include all backends that might be relevant."""
+- **utility_tools**: Dict mapping server name to list of specific tool names.
+  These are auxiliary tools for supporting operations (e.g., filesystem: ["write_file"], time-server: ["get_time"]).
+  Only include the specific tools needed, NOT the entire server.
+- **domain_servers**: Server names that directly provide the main capabilities for the task.
+  All tools from these servers will be considered. Be inclusive here."""
 
-        user_query = f"Task: {prompt}\n\nBased on the task above, which backend(s) and server(s) should be used?"
+        user_query = f"Task: {task_prompt}\n\nClassify the needed servers and tools."
 
-        conversation_history = [
+        messages_text = LLMClient.format_messages_to_text([
             {"role": "system", "content": TOOL_FILTER_SYSTEM_PROMPT},
             {"role": "user", "content": user_query}
-        ]
-
-        # Format conversation and call LLM
-        messages_text = LLMClient.format_messages_to_text(conversation_history)
+        ])
         resp = await self._llm.complete(messages_text)
-        
         content = resp["message"]["content"].strip()
         
-        # Try to extract JSON from markdown code block or plain text
-        # regex: match ``` code block or directly find JSON array/object
+        # Extract JSON
         code_block_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
         match = re.search(code_block_pattern, content, re.DOTALL)
         if match:
             content = match.group(1).strip()
         else:
-            # if no code block, try to directly extract JSON array
-            json_pattern = r'\[.*\]'
-            match = re.search(json_pattern, content, re.DOTALL)
-            if match:
-                content = match.group(0)
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                content = json_match.group()
         
         try:
-            choices = json.loads(content)
-            if not isinstance(choices, list):
-                logger.warning(f"Expected list but got {type(choices)}")
-                return tools
+            result = json.loads(content)
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse LLM response as JSON: {content[:200]}... Error: {e}")
-            return tools  # return all tools if parsing failed
+            logger.warning(f"Failed to parse LLM response: {e}")
+            return [], tools
         
-        # Filter tools matching any of the chosen backend/server combinations
-        result = []
-        for t in tools:
-            if t.is_bound:
-                t_backend = t.runtime_info.backend.value
-                t_server = t.runtime_info.server_name
-            else:
-                if not t.backend_type or t.backend_type == BackendType.NOT_SET:
-                    logger.warning(f"Tool {t.name} has no backend info, skipping")
-                    continue
-                t_backend = t.backend_type.value
-                t_server = None
-            
-            for choice in choices:
-                # Case-insensitive backend comparison
-                choice_backend = choice.get("backend", "").upper()
-                if t_backend.upper() == choice_backend and (
-                    choice.get("server") is None or t_server == choice.get("server")
-                ):
-                    result.append(t)
-                    break  # Avoid duplicates
+        # Parse utility_tools: {server: [tool_names]}
+        utility_tools_config = result.get("utility_tools", {})
+        domain_servers = set(result.get("domain_servers", []))
+        brief_plan = result.get("brief_plan", "N/A")
         
-        # If no tools matched, log warning and return all tools
-        if not result:
-            logger.warning(
-                f"LLM filter matched 0 tools. LLM selected: {choices}. "
-                f"Returning all {len(tools)} tools."
-            )
-            return tools
+        logger.info(f"LLM Planning: {brief_plan}")
+        logger.info(f"Utility tools: {utility_tools_config}")
+        logger.info(f"Domain servers: {domain_servers}")
         
-        logger.info(f"LLM filter: {len(tools)} tools → {len(result)} tools")
-        return result
+        # Collect utility tools (specific tools only)
+        utility_tools = []
+        for server_name, tool_names in utility_tools_config.items():
+            if server_name in server_tools:
+                server_tool_names = {t.name for t in server_tools[server_name]}
+                for tool_name in tool_names:
+                    if tool_name in server_tool_names and tool_name in tool_name_map:
+                        utility_tools.append(tool_name_map[tool_name])
+        
+        # Collect domain tools (entire servers)
+        domain_tools = []
+        for server, tool_list in server_tools.items():
+            if server in domain_servers:
+                domain_tools.extend(tool_list)
+        
+        logger.info(f"LLM filter result: {len(utility_tools)} utility tools, {len(domain_tools)} domain tools")
+        
+        # Build LLM filter info for debugging
+        llm_filter_info = {
+            "brief_plan": brief_plan,
+            "utility_tools": utility_tools_config,
+            "domain_servers": list(domain_servers),
+        }
+        
+        # Fallback if no match
+        if not utility_tools and not domain_tools:
+            logger.warning(f"LLM filter matched 0 tools, returning all as domain")
+            return [], tools, llm_filter_info
+        
+        return utility_tools, domain_tools, llm_filter_info
+
+    async def _generate_search_query(self, task_prompt: str) -> str:
+        prompt = f"""Task: {task_prompt}
+
+List keywords for the capabilities needed (comma-separated, brief):"""
+
+        resp = await self._llm.complete(prompt)
+        capabilities = resp["message"]["content"].strip().replace("\n", " ")
+        
+        enhanced_query = f"{task_prompt} {capabilities}"
+        logger.debug(f"Enhanced search query: {enhanced_query[:150]}...")
+        
+        return enhanced_query
 
     def _log_search_results(self, all_tools: list[BaseTool], filtered_tools: list[BaseTool], mode: str) -> None:
         """
@@ -842,3 +1099,20 @@ If unsure, include all backends that might be relevant."""
             Number of embeddings cleared.
         """
         return self._ranker.clear_cache(backend=backend, server=server)
+    
+    def get_last_search_debug_info(self) -> Optional[Dict[str, Any]]:
+        """Get debug info from the last search operation.
+        
+        Returns:
+            Dict containing search debug info, or None if no search has been performed.
+            Includes:
+                - search_mode: The search mode used
+                - total_candidates: Total number of candidate tools
+                - mcp_count/non_mcp_count: Tool counts by type
+                - llm_filter: LLM filter information if used
+                - tool_scores: Similarity scores for each tool
+                - selected_tools: Final selected tools
+        """
+        if self._last_search_debug_info is None:
+            return None
+        return self._last_search_debug_info.to_dict()

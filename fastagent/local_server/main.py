@@ -1108,18 +1108,45 @@ def run_server(host: str = "127.0.0.1", port: int = 5000, debug: bool = False):
     
     app.run(host=host, port=port, debug=debug, threaded=True)
 
-if __name__ == "__main__":
-    # Load configuration
+def main():
+    import argparse
     from fastagent.config.utils import get_config_value
-    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+
+    parser = argparse.ArgumentParser(
+        description='FastAgent Local Server - Desktop Control Server'
+    )
+    parser.add_argument('--host', type=str, default='127.0.0.1',
+                       help='Server host (default: 127.0.0.1)')
+    parser.add_argument('--port', type=int, default=5000,
+                       help='Server port (default: 5000)')
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable debug mode')
+    parser.add_argument('--config', type=str,
+                       help='Path to config.json file')
+
+    args = parser.parse_args()
+
+    config_path = args.config
+    if not config_path:
+        config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+
     if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-            server_config = get_config_value(config, 'server', {})
-            run_server(
-                host=get_config_value(server_config, 'host', '127.0.0.1'),
-                port=get_config_value(server_config, 'port', 5000),
-                debug=get_config_value(server_config, 'debug', False)
-            )
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                server_config = get_config_value(config, 'server', {})
+
+                host = args.host if args.host != '127.0.0.1' else get_config_value(server_config, 'host', '127.0.0.1')
+                port = args.port if args.port != 5000 else get_config_value(server_config, 'port', 5000)
+                debug = args.debug or get_config_value(server_config, 'debug', False)
+
+                run_server(host=host, port=port, debug=debug)
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+            run_server(host=args.host, port=args.port, debug=args.debug)
     else:
-        run_server()
+        run_server(host=args.host, port=args.port, debug=args.debug)
+
+
+if __name__ == "__main__":
+    main()

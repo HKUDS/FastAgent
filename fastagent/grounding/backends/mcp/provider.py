@@ -8,10 +8,12 @@ from typing import Dict, List, Optional
 
 from fastagent.grounding.backends.mcp.session import MCPSession
 from fastagent.grounding.core.provider import Provider
-from fastagent.grounding.core.types import SessionConfig, BackendType
+from fastagent.grounding.core.types import SessionConfig, BackendType, ToolSchema
 from fastagent.grounding.backends.mcp.client import MCPClient
 from fastagent.grounding.backends.mcp.installer import MCPInstallerManager, MCPDependencyError
-from fastagent.grounding.core.tool import BaseTool
+from fastagent.grounding.backends.mcp.tool_cache import get_tool_cache
+from fastagent.grounding.backends.mcp.tool_converter import _sanitize_mcp_schema
+from fastagent.grounding.core.tool import BaseTool, RemoteTool
 from fastagent.utils.logging import Logger
 from fastagent.config.utils import get_config_value
 
@@ -43,6 +45,10 @@ class MCPProvider(Provider[MCPSession]):
         max_retries = get_config_value(config, "max_retries", 3)
         retry_interval = get_config_value(config, "retry_interval", 2.0)
         check_dependencies = get_config_value(config, "check_dependencies", True)
+        auto_install = get_config_value(config, "auto_install", False)
+        # Tool call retry settings (for transient errors like 400, 500, etc.)
+        tool_call_max_retries = get_config_value(config, "tool_call_max_retries", 3)
+        tool_call_retry_delay = get_config_value(config, "tool_call_retry_delay", 1.0)
         
         # Create sandbox options if sandbox is enabled
         sandbox_options = None
@@ -51,6 +57,10 @@ class MCPProvider(Provider[MCPSession]):
                 "timeout": timeout,
                 "sse_read_timeout": sse_read_timeout,
             }
+        
+        # Create installer with auto_install setting if not provided
+        if installer is None and auto_install:
+            installer = MCPInstallerManager(auto_install=True)
         
         # Initialize MCPClient with configuration
         self._client = MCPClient(
@@ -63,6 +73,8 @@ class MCPProvider(Provider[MCPSession]):
             retry_interval=retry_interval,
             installer=installer,
             check_dependencies=check_dependencies,
+            tool_call_max_retries=tool_call_max_retries,
+            tool_call_retry_delay=tool_call_retry_delay,
         )
         
         # Map server name to session for quick lookup
@@ -185,27 +197,27 @@ class MCPProvider(Provider[MCPSession]):
             if error_occurred:
                 logger.warning(f"Session '{session_name}' removed from tracking despite close error")
 
-    async def list_tools(self, session_name: str | None = None) -> List[BaseTool]:
+    async def list_tools(self, session_name: str | None = None, use_cache: bool = True) -> List[BaseTool]:
         """List tools from MCP sessions.
         
         Args:
             session_name: If provided, only list tools from that session.
                          If None, list tools from all sessions.
+            use_cache: If True, try to load from cache first (no server startup).
+                      If False, start servers and get live tools.
         
         Returns:
             List of BaseTool instances
         """
         await self.ensure_initialized()
         
-        # Case 1: List tools from specific session
+        # Case 1: List tools from specific session (always live, no cache)
         if session_name:
             sess = self._sessions.get(session_name)
             if sess:
                 try:
                     tools = await sess.list_tools()
-                    # Extract server name from session_name (format: mcp-<server_name>)
                     server_name = session_name.replace(f"{self.backend_type.value}-", "", 1)
-                    # Bind runtime info to each tool
                     for tool in tools:
                         tool.bind_runtime_info(
                             backend=self.backend_type,
@@ -221,6 +233,106 @@ class MCPProvider(Provider[MCPSession]):
                 return []
 
         # Case 2: List tools from all servers
+        # Try cache first if enabled
+        if use_cache:
+            cache = get_tool_cache()
+            if cache.has_cache():
+                tools = self._load_tools_from_cache()
+                if tools:
+                    logger.info(f"Loaded {len(tools)} tools from cache (no server startup)")
+                    return tools
+        
+        # No cache or cache disabled, start servers
+        return await self._list_tools_live()
+    
+    def _load_tools_from_cache(self) -> List[BaseTool]:
+        """Load tools from cache file without starting servers.
+        
+        Priority:
+        1. Try to load from sanitized cache (mcp_tool_cache_sanitized.json)
+        2. If not exists, load from raw cache and sanitize, then save sanitized version
+        """
+        cache = get_tool_cache()
+        config_servers = self.list_servers()
+        
+        # Try sanitized cache first
+        if cache.has_sanitized_cache():
+            logger.debug("Loading from sanitized cache")
+            all_cached_tools = cache.get_all_sanitized_tools()
+            return self._build_tools_from_cache(all_cached_tools, config_servers)
+        
+        # Fall back to raw cache, sanitize and save
+        if cache.has_cache():
+            logger.info("Sanitized cache not found, building from raw cache...")
+            all_cached_tools = cache.get_all_tools()
+            sanitized_servers = self._sanitize_and_save_cache(all_cached_tools, cache)
+            return self._build_tools_from_cache(sanitized_servers, config_servers)
+        
+        return []
+    
+    def _sanitize_and_save_cache(
+        self, 
+        raw_tools: Dict[str, List[Dict]], 
+        cache
+    ) -> Dict[str, List[Dict]]:
+        """Sanitize raw cache and save to sanitized cache file."""
+        sanitized_servers: Dict[str, List[Dict]] = {}
+        
+        for server_name, tool_list in raw_tools.items():
+            sanitized_tools = []
+            for tool_meta in tool_list:
+                raw_params = tool_meta.get("parameters", {})
+                sanitized_params = _sanitize_mcp_schema(raw_params)
+                sanitized_tools.append({
+                    "name": tool_meta["name"],
+                    "description": tool_meta.get("description", ""),
+                    "parameters": sanitized_params,
+                })
+            sanitized_servers[server_name] = sanitized_tools
+        
+        # Save sanitized cache for future use
+        cache.save_sanitized(sanitized_servers)
+        logger.info(f"Created sanitized cache with {len(sanitized_servers)} servers")
+        
+        return sanitized_servers
+    
+    def _build_tools_from_cache(
+        self, 
+        all_cached_tools: Dict[str, List[Dict]], 
+        config_servers: List[str]
+    ) -> List[BaseTool]:
+        """Build BaseTool instances from cached tool metadata."""
+        tools: List[BaseTool] = []
+        
+        for server_name in config_servers:
+            tool_list = all_cached_tools.get(server_name)
+            if not tool_list:
+                continue
+            
+            session_name = f"{self.backend_type.value}-{server_name}"
+            for tool_meta in tool_list:
+                schema = ToolSchema(
+                    name=tool_meta["name"],
+                    description=tool_meta.get("description", ""),
+                    parameters=tool_meta.get("parameters", {}),
+                    backend_type=BackendType.MCP,
+                )
+                tool = RemoteTool(schema=schema, connector=None)
+                tool.bind_runtime_info(
+                    backend=self.backend_type,
+                    session_name=session_name,
+                    server_name=server_name,
+                )
+                tools.append(tool)
+        
+        return tools
+    
+    async def _list_tools_live(self) -> List[BaseTool]:
+        """List tools by starting all servers.
+        
+        Uses a semaphore to serialize session creation, avoiding TaskGroup race conditions
+        that occur when multiple MCP connections are initialized concurrently.
+        """
         servers = self.list_servers()
         
         if not servers:
@@ -230,26 +342,34 @@ class MCPProvider(Provider[MCPSession]):
         # Find servers that don't have sessions yet
         to_create = [s for s in servers if s not in self._server_sessions]
 
-        # Lazily create missing sessions in parallel
+        # Create missing sessions with serialized execution using semaphore
         if to_create:
-            logger.debug(f"Lazily creating {len(to_create)} MCP sessions")
-            results = await asyncio.gather(
-                *(self._lazy_create(s) for s in to_create),
-                return_exceptions=True
-            )
-            # Log any errors from lazy creation
+            logger.info(f"Creating {len(to_create)} MCP sessions (serialized to avoid race conditions)")
+            
+            # Use semaphore with limit=1 to serialize session creation
+            # This avoids TaskGroup race conditions in concurrent HTTP connection setup
+            semaphore = asyncio.Semaphore(1)
+            
+            async def _create_with_semaphore(server: str):
+                async with semaphore:
+                    logger.debug(f"Creating session for '{server}'")
+                    return await self._lazy_create(server)
+            
+            tasks = [_create_with_semaphore(s) for s in to_create]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Log errors
             for i, result in enumerate(results):
                 if isinstance(result, MCPDependencyError):
-                    # Dependency errors already shown to user
                     logger.debug(f"Dependency error for '{to_create[i]}': {type(result).__name__}")
                 elif isinstance(result, Exception):
-                    logger.error(f"Failed to lazily create session for '{to_create[i]}': {result}")
+                    logger.error(f"Failed to create session for '{to_create[i]}': {result}")
 
-        # Aggregate tools from all sessions with deduplication
-        # Use (server, tool_name) as key to avoid duplicates
+        # Aggregate tools from all sessions
         uniq: Dict[tuple[str, str], BaseTool] = {}
         failed_servers = []
         
+        logger.debug(f"Listing tools from {len(self._server_sessions)} sessions")
         for server, sess in self._server_sessions.items():
             try:
                 tools = await sess.list_tools()
@@ -257,7 +377,6 @@ class MCPProvider(Provider[MCPSession]):
                 for tool in tools:
                     key = (server, tool.schema.name)
                     if key not in uniq:
-                        # Bind runtime info to each tool with correct session name
                         tool.bind_runtime_info(
                             backend=self.backend_type,
                             session_name=session_name,
@@ -273,7 +392,52 @@ class MCPProvider(Provider[MCPSession]):
         
         tools_list = list(uniq.values())
         logger.debug(f"Listed {len(tools_list)} unique tools from {len(self._server_sessions)} MCP servers")
+        
+        # Save to cache for next time
+        await self._save_tools_to_cache(tools_list)
+        
         return tools_list
+    
+    async def _save_tools_to_cache(self, tools: List[BaseTool]) -> None:
+        """Save tools metadata to cache file."""
+        cache = get_tool_cache()
+        
+        # Group tools by server
+        servers: Dict[str, List[Dict]] = {}
+        for tool in tools:
+            server_name = tool.runtime_info.server_name if tool.is_bound else "unknown"
+            if server_name not in servers:
+                servers[server_name] = []
+            servers[server_name].append({
+                "name": tool.schema.name,
+                "description": tool.schema.description or "",
+                "parameters": tool.schema.parameters or {},
+            })
+        
+        cache.save(servers)
+    
+    async def ensure_server_session(self, server_name: str) -> Optional[MCPSession]:
+        """Ensure a server session exists, creating it if needed.
+        
+        This is used for on-demand server startup when executing tools.
+        """
+        if server_name in self._server_sessions:
+            return self._server_sessions[server_name]
+        
+        # Server not running, start it
+        logger.info(f"Starting MCP server on-demand: {server_name}")
+        cfg = SessionConfig(
+            session_name=f"mcp-{server_name}",
+            backend_type=BackendType.MCP,
+            connection_params={"server": server_name},
+        )
+        
+        try:
+            session = await self.create_session(cfg)
+            return session
+        except Exception as e:
+            logger.error(f"Failed to start server '{server_name}': {e}")
+            return None
 
     async def _lazy_create(self, server: str) -> None:
         """Internal helper for lazy session creation.

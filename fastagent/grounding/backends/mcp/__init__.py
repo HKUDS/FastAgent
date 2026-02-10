@@ -8,6 +8,7 @@ for the grounding framework. It includes:
 - MCPSession: Handles individual MCP server connections
 - MCPClient: High-level client for MCP server configuration
 - MCPInstallerManager: Manages automatic installation of MCP dependencies
+- MCPToolCache: Caches tool metadata to avoid starting servers on list_tools
 """
 
 from .provider import MCPProvider
@@ -22,6 +23,7 @@ from .installer import (
     MCPInstallationCancelledError,
     MCPInstallationFailedError,
 )
+from .tool_cache import MCPToolCache, get_tool_cache
 
 __all__ = [
     "MCPProvider",
@@ -34,4 +36,6 @@ __all__ = [
     "MCPCommandNotFoundError",
     "MCPInstallationCancelledError",
     "MCPInstallationFailedError",
+    "MCPToolCache",
+    "get_tool_cache",
 ]

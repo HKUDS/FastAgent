@@ -147,6 +147,13 @@ class MCPInstallerManager:
                     result = await self._check_python_package(package_name)
                     self._installed_cache[cache_key] = result
                     return result
+            elif command == "uv":
+                # For "uv run --with package ...", check if the Python package exists
+                package_name = self._extract_uv_package(args)
+                if package_name:
+                    result = await self._check_uv_pip_package(package_name)
+                    self._installed_cache[cache_key] = result
+                    return result
         except Exception as e:
             logger.debug(f"Error checking package installation status: {e}")
         
@@ -160,14 +167,31 @@ class MCPInstallerManager:
             args: npx arguments list, e.g. ["-y", "mcp-excalidraw-server"] or ["bazi-mcp"]
             
         Returns:
-            Package name or None
+            Package name (without version tag) or None
         """
         for i, arg in enumerate(args):
             # Skip option parameters
             if arg.startswith("-"):
                 continue
-            # Return the first non-option parameter
-            return arg
+            
+            # Found package name, now strip version tag
+            package_name = arg
+            
+            # Handle scoped packages: @scope/package@version -> @scope/package
+            if package_name.startswith("@"):
+                # Scoped package like @rtuin/mcp-mermaid-validator@latest
+                parts = package_name.split("/", 1)
+                if len(parts) == 2:
+                    scope = parts[0]
+                    name_with_version = parts[1]
+                    # Remove version tag from name part (e.g., "pkg@latest" -> "pkg")
+                    name = name_with_version.split("@")[0] if "@" in name_with_version else name_with_version
+                    return f"{scope}/{name}"
+                return package_name
+            else:
+                # Regular package like mcp-deepwiki@latest -> mcp-deepwiki
+                return package_name.split("@")[0] if "@" in package_name else package_name
+        
         return None
     
     def _extract_python_package(self, args: List[str]) -> Optional[str]:
@@ -175,19 +199,58 @@ class MCPInstallerManager:
         
         Args:
             args: uvx arguments list, e.g. ["--from", "office-powerpoint-mcp-server", "ppt_mcp_server"]
+                  or ["--with", "mcp==1.9.0", "sitemap-mcp-server"]
+                  or ["arxiv-mcp-server", "--storage-path", "./path"]
             
         Returns:
             Package name or None
         """
-        # Find --from parameter
+        # Find --from parameter (this is the package to install)
         for i, arg in enumerate(args):
             if arg == "--from" and i + 1 < len(args):
                 return args[i + 1]
         
-        # If there is no --from, return the first non-option parameter
+        # Skip option flags and their values, find the main package (FIRST positional arg)
+        # Options that take a value: --with, --python, --from, --storage-path, etc.
+        options_with_value = {"--with", "--from", "--python", "-p", "--storage-path"}
+        skip_next = False
+        
         for arg in args:
-            if not arg.startswith("-"):
-                return arg
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in options_with_value:
+                skip_next = True
+                continue
+            if arg.startswith("-"):
+                # Other flags without values (or unknown options with values)
+                # Also skip the next arg if it looks like an option value (doesn't start with -)
+                continue
+            # First non-option argument is the package name
+            return arg
+        
+        return None
+    
+    def _extract_uv_package(self, args: List[str]) -> Optional[str]:
+        """Extract package name from uv run arguments.
+        
+        Args:
+            args: uv arguments list, e.g. ["run", "--with", "biomcp-python", "biomcp", "run"]
+            
+        Returns:
+            Package name or None
+        """
+        # Find --with parameter (this specifies the package to install)
+        for i, arg in enumerate(args):
+            if arg == "--with" and i + 1 < len(args):
+                package_name = args[i + 1]
+                # Remove version specifier if present (e.g., "mcp==1.9.0" -> "mcp")
+                if "==" in package_name:
+                    return package_name.split("==")[0]
+                if ">=" in package_name:
+                    return package_name.split(">=")[0]
+                return package_name
+        
         return None
     
     async def _check_npm_package(self, package_name: str) -> bool:
@@ -214,27 +277,93 @@ class MCPInstallerManager:
             return False
     
     async def _check_python_package(self, package_name: str) -> bool:
-        """Check if the Python package is installed.
+        """Check if the Python package is installed as a uvx tool.
+        
+        uvx tools are installed in ~/.local/share/uv/tools/ directory,
+        not in the current pip environment.
+        
+        Args:
+            package_name: Python package/tool name
+            
+        Returns:
+            bool: Whether the uvx tool is installed
+        """
+        import os
+        from pathlib import Path
+        
+        # Strip version specifier if present (e.g., "mcp==1.9.0" -> "mcp")
+        clean_name = package_name.split("==")[0].split(">=")[0].split("<=")[0].split(">")[0].split("<")[0]
+        
+        # Check if uvx tool exists in the standard uv tools directory
+        uv_tools_dir = Path.home() / ".local" / "share" / "uv" / "tools"
+        tool_dir = uv_tools_dir / clean_name
+        
+        if tool_dir.exists():
+            logger.debug(f"uvx tool '{clean_name}' found at {tool_dir}")
+            return True
+        
+        # Fallback: try running uvx with --help to check if it's available
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "uvx", clean_name, "--help",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            # Just wait briefly, don't need the full output
+            try:
+                await asyncio.wait_for(process.communicate(), timeout=5.0)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+            
+            # If it didn't error immediately, the tool likely exists
+            return process.returncode == 0
+        except Exception as e:
+            logger.debug(f"Error checking uvx tool {clean_name}: {e}")
+        
+        return False
+    
+    async def _check_uv_pip_package(self, package_name: str) -> bool:
+        """Check if a Python package is installed via uv pip.
         
         Args:
             package_name: Python package name
             
         Returns:
-            bool: Whether the Python package is installed
+            bool: Whether the package is installed
         """
+        # Strip version specifier if present
+        clean_name = package_name.split("==")[0].split(">=")[0].split("<=")[0].split(">")[0].split("<")[0]
+        
         try:
+            # Try using uv pip show to check if package is installed
             process = await asyncio.create_subprocess_exec(
-                "pip", "show", package_name,
+                "uv", "pip", "show", clean_name,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             stdout, stderr = await process.communicate()
             
-            # pip show returns 0 if the package is installed
+            if process.returncode == 0:
+                logger.debug(f"uv pip package '{clean_name}' found")
+                return True
+        except Exception as e:
+            logger.debug(f"Error checking uv pip package {clean_name}: {e}")
+        
+        # Fallback: check with regular pip
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "pip", "show", clean_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
             return process.returncode == 0
         except Exception as e:
-            logger.debug(f"Error checking Python package {package_name}: {e}")
-            return False
+            logger.debug(f"Error checking pip package {clean_name}: {e}")
+        
+        return False
     
     async def _install_package(self, command: str, args: List[str], use_sudo: bool = False) -> bool:
         """Execute the install command.
@@ -385,7 +514,7 @@ class MCPInstallerManager:
         """Generate install command based on command type.
         
         Args:
-            command: The command to execute (e.g. "npx", "uvx")
+            command: The command to execute (e.g. "npx", "uvx", "uv")
             args: The original arguments list
             
         Returns:
@@ -399,6 +528,11 @@ class MCPInstallerManager:
             package_name = self._extract_python_package(args)
             if package_name:
                 return ["pip", "install", package_name]
+        elif command == "uv":
+            # Handle "uv run --with package_name ..." format
+            package_name = self._extract_uv_package(args)
+            if package_name:
+                return ["uv", "pip", "install", package_name]
         
         return None
     
@@ -442,6 +576,15 @@ class MCPInstallerManager:
             logger.debug(f"Skipping dependency check for direct script execution command: {command}")
             return True
         
+        # Skip dependency checking for GitHub-based npx packages
+        # These packages are handled directly by npx which downloads, builds, and runs them
+        # npm install -g doesn't work properly for GitHub packages that require building
+        if command == "npx":
+            package_name = self._extract_npm_package(args)
+            if package_name and package_name.startswith("github:"):
+                logger.debug(f"Skipping dependency check for GitHub-based npx package: {package_name}")
+                return True
+        
         # Check if this server has already failed installation
         cache_key = f"{server_name}:{command}:{':'.join(args)}"
         if cache_key in self._failed_installations:
@@ -484,6 +627,9 @@ class MCPInstallerManager:
             package_type = "npm"
         elif command == "uvx":
             package_name = self._extract_python_package(args)
+            package_type = "Python"
+        elif command == "uv":
+            package_name = self._extract_uv_package(args)
             package_type = "Python"
         else:
             package_name = f"{command} {' '.join(args)}"

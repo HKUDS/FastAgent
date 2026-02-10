@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import copy
 import json
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from fastagent.agents.base import BaseAgent
-from fastagent.llm import LLMClient
-from fastagent.grounding.core.grounding_client import GroundingClient
-from fastagent.grounding.core.types import BackendType
+from fastagent.grounding.core.types import BackendType, ToolResult
+from fastagent.platform.screenshot import ScreenshotClient
+from fastagent.prompts import GroundingAgentPrompts
 from fastagent.utils.logging import Logger
 
 if TYPE_CHECKING:
+    from fastagent.llm import LLMClient
     from fastagent.agents.coordinator import AgentCoordinator
+    from fastagent.grounding.core.grounding_client import GroundingClient
     from fastagent.recording import RecordingManager
 
 logger = Logger.get_logger(__name__)
@@ -24,38 +27,52 @@ class GroundingAgent(BaseAgent):
         llm_client: Optional[LLMClient] = None,
         coordinator: Optional[AgentCoordinator] = None,
         system_prompt: Optional[str] = None,
-        max_iterations: int = 20,
+        max_iterations: int = 15,
+        visual_analysis_timeout: float = 30.0,
+        tool_retrieval_llm: Optional[LLMClient] = None,
+        visual_analysis_model: Optional[str] = None,
     ) -> None:
         """
         Initialize the Grounding Agent.
-        
+
         Args:
             name: Agent name
             backend_scope: List of backends this agent can access (None = all available)
             llm_client: LLM client for reasoning
             coordinator: AgentCoordinator for resource access
             system_prompt: Custom system prompt
-            max_iterations: Maximum LLM reasoning iterations for self-correction (default: 10)
+            max_iterations: Maximum LLM reasoning iterations for self-correction
+            visual_analysis_timeout: Timeout for visual analysis LLM calls in seconds
+            tool_retrieval_llm: LLM client for tool retrieval filter (None = use llm_client)
+            visual_analysis_model: Model name for visual analysis (None = use llm_client.model)
         """
         super().__init__(
             name=name,
             backend_scope=backend_scope or ["gui", "shell", "mcp", "web", "system"],
             llm_client=llm_client,
-            coordinator=coordinator
+            coordinator=coordinator,
         )
-        
+
         self._system_prompt = system_prompt or self._default_system_prompt()
         self._max_iterations = max_iterations
-        
+        self._visual_analysis_timeout = visual_analysis_timeout
+        self._tool_retrieval_llm = tool_retrieval_llm
+        self._visual_analysis_model = visual_analysis_model
+
         logger.info(f"Grounding Agent initialized: {name}")
         logger.info(f"Backend scope: {self._backend_scope}")
-        logger.info(f"Max iterations (self-correction): {self._max_iterations}")
+        logger.info(f"Max iterations: {self._max_iterations}")
+        logger.info(f"Visual analysis timeout: {self._visual_analysis_timeout}s")
+        if tool_retrieval_llm:
+            logger.info(f"Tool retrieval model: {tool_retrieval_llm.model}")
+        if visual_analysis_model:
+            logger.info(f"Visual analysis model: {visual_analysis_model}")
 
     @property
     def grounding_client(self) -> Optional[GroundingClient]:
         """Get the grounding client from coordinator."""
         return self.get_grounding_client()
-    
+
     @property
     def recording_manager(self) -> Optional[RecordingManager]:
         """Get the recording manager from coordinator."""
@@ -65,1051 +82,1168 @@ class GroundingAgent(BaseAgent):
 
     def _default_system_prompt(self) -> str:
         """Default system prompt for the grounding agent."""
-        # Dynamically generate available backend types from backend_scope
-        available_backends = ", ".join([backend.upper() for backend in self._backend_scope])
-        
-        return f"""You are a Grounding Agent responsible for executing concrete tasks using available tools.
+        return GroundingAgentPrompts.SYSTEM_PROMPT
 
-## Role in the System
+    # ------------------------------------------------------------------
+    # Message truncation (prevent context overflow in long iterations)
+    # ------------------------------------------------------------------
 
-You receive specific task instructions from the Host Agent, which has already decomposed the user's request into clear subtasks. Your job is to:
-1. Execute the given task using appropriate tools
-2. Save any outputs/results immediately
-3. Report completion status
-
-Available backends: {available_backends}
-
-## Core Principle: Task Completion
-
-Your PRIMARY goal is completing the assigned task. The task description tells you WHAT to achieve, not HOW to do it. You decide which tools to use based on the task requirements.
-
-Success = Task objective achieved + Required outputs saved
-
-## Execution Guidelines
-
-### Tool Selection
-- Read the task description carefully to understand requirements
-- Choose tools based on what the task needs to accomplish
-- You have access to ALL tools - pick the right ones for the job
-
-### Save Your Work
-Critical rule: If you create, retrieve, or generate ANY data or content, you MUST save it immediately.
-
-- Break complex tasks into smaller tool calls when appropriate
-- Choose the most suitable tool for each specific task
-- Explain your reasoning when selecting tools
-- If a tool fails, try alternative approaches or report the issue clearly
-- Summarize final results after completing all necessary tool calls
-
-Use the workspace_dir provided in context. Do NOT create subdirectories unless explicitly required.
-
-### When to Stop
-Stop immediately when:
-- Task objective is achieved
-- Required outputs are saved
-- No further action adds value
-
-Do NOT:
-- Over-verify (checking multiple times)
-- Add extra features not requested
-- Continue working after task is complete
-
-### Error Handling
-If a tool fails:
-- Try alternative approaches
-- Use different tools if available
-- Report if task cannot be completed
-
-## Execution Flow
-
-1. Understand: Read the task instruction
-2. Execute: Call appropriate tools to complete the task
-3. Save: Immediately save any outputs
-4. Report: Briefly describe what was done
-
-## Communication Format
-
-Keep responses concise and factual. After completing your work, include a summary in this format:
-
-[SUMMARY]
-What I did: <brief description>
-Has artifacts: YES/NO
-Artifact type: <type if YES>
-Artifact source: <tool name if YES>
-Artifact description: <content description if YES>
-
-## Important Notes
-
-- The Host Agent has already planned the overall workflow - you execute individual tasks
-- Focus on task completion, not process documentation
-- Be decisive - if the task is done, stop
-- Save work immediately after creation/retrieval
-- Report failures clearly so the system can adapt
-
-## Example
-
-Task: "Search web for latest AI news, save top 5 results to news.json"
-
-<I execute web_search tool and save results>
-
-[SUMMARY]
-What I did: Searched for AI news, saved top 5 articles to news.json
-Has artifacts: YES
-Artifact type: query_result
-Artifact source: web_search
-Artifact description: JSON file with 5 articles (titles, URLs, summaries, dates)
-
-Task complete."""
-
-    async def get_backend_descriptions(self) -> Dict[str, str]:
-        """
-        Get descriptions of all available backends, their servers, and tools.
-        
-        For MCP backend, groups tools by server to help HostAgent understand
-        which server provides which capabilities.
-        
-        Returns:
-            Dictionary mapping backend names to their detailed descriptions
-        """
-        grounding_client = self.grounding_client
-        if not grounding_client:
-            logger.warning("Grounding Agent: No grounding client available")
-            return {}
-        
-        descriptions = {}
-        
-        try:
-            # Get descriptions for each backend in scope
-            for backend_name in self._backend_scope:
-                try:
-                    if backend_name == "system":
-                        descriptions[backend_name] = "System tools for querying backend capabilities"
-                        continue
-                    
-                    backend_type = BackendType(backend_name)
-                    tools = await grounding_client.list_tools(
-                        backend=backend_type
-                    )
-                    
-                    if not tools:
-                        descriptions[backend_name] = f"Backend '{backend_name}' available but no tools found"
-                        continue
-                    
-                    # Group tools by server (important for MCP which has multiple servers)
-                    server_tools = {}
-                    for tool in tools:
-                        # Get server name from tool's runtime info
-                        server_name = getattr(tool.runtime_info, 'server_name', None) if hasattr(tool, 'runtime_info') else None
-                        if server_name not in server_tools:
-                            server_tools[server_name] = []
-                        server_tools[server_name].append(tool)
-                    
-                    # Build description
-                    desc_lines = []
-                    
-                    good_for_map = {
-                        "shell": "File operations, command execution, system tasks",
-                        "gui": "GUI automation, browser control, visual interactions",
-                        "mcp": "Application control via MCP servers",
-                        "web": "Web search, information gathering",
-                        "system": "Querying system capabilities"
-                    }
-                    
-                    if backend_name.lower() == "mcp":
-                        # For MCP, show each server with its tools
-                        desc_lines.append(f"MCP Backend ({len(tools)} total tools across {len(server_tools)} servers)")
-                        desc_lines.append(f"Good for: {good_for_map.get(backend_name.lower(), 'Various tasks')}")
-                        
-                        for server_name, server_tool_list in server_tools.items():
-                            server_display = server_name or "<default>"
-                            desc_lines.append(f"\n  Server: {server_display} ({len(server_tool_list)} tools)")
-                            
-                            # Show tool names
-                            tool_names = [t.schema.name for t in server_tool_list]
-                            desc_lines.append(f"    Tools: {', '.join(tool_names[:8])}")
-                            if len(tool_names) > 8:
-                                desc_lines.append(f"           {', '.join(tool_names[8:16])}")
-                                if len(tool_names) > 16:
-                                    desc_lines.append(f"           (and {len(tool_names) - 16} more)")
-                            
-                            # Show example tool descriptions
-                            examples = server_tool_list[:3]
-                            if examples:
-                                desc_lines.append(f"    Example capabilities:")
-                                for tool in examples:
-                                    tool_desc = tool.schema.description or "No description"
-                                    if len(tool_desc) > 80:
-                                        tool_desc = tool_desc[:77] + "..."
-                                    desc_lines.append(f"      - {tool.schema.name}: {tool_desc}")
-                    else:
-                        # For non-MCP backends, show all tools together
-                        desc_lines.append(f"{backend_name.upper()} Backend ({len(tools)} tools)")
-                        desc_lines.append(f"Good for: {good_for_map.get(backend_name.lower(), 'Various tasks')}")
-                        
-                        tool_names = [t.schema.name for t in tools]
-                        desc_lines.append(f"  Tools: {', '.join(tool_names[:10])}")
-                        if len(tool_names) > 10:
-                            desc_lines.append(f"         {', '.join(tool_names[10:20])}")
-                            if len(tool_names) > 20:
-                                desc_lines.append(f"         (and {len(tool_names) - 20} more)")
-                        
-                        # Show example tool descriptions
-                        examples = tools[:3]
-                        if examples:
-                            desc_lines.append(f"  Example capabilities:")
-                            for tool in examples:
-                                tool_desc = tool.schema.description or "No description"
-                                if len(tool_desc) > 80:
-                                    tool_desc = tool_desc[:77] + "..."
-                                desc_lines.append(f"    - {tool.schema.name}: {tool_desc}")
-                    
-                    descriptions[backend_name] = "\n".join(desc_lines)
-                    logger.debug(f"Backend {backend_name}: {len(tools)} tools across {len(server_tools)} servers")
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to get description for backend {backend_name}: {e}")
-                    descriptions[backend_name] = f"Backend available but description unavailable: {e}"
-            
-            logger.info(f"Grounding Agent: Retrieved descriptions for {len(descriptions)} backends")
-            return descriptions
-            
-        except Exception as e:
-            logger.error(f"Grounding Agent: Failed to get backend descriptions: {e}")
-            return {"error": f"Failed to retrieve backend descriptions: {e}"}
-
-    def construct_messages(
+    def _truncate_messages(
         self,
-        instruction: str,
-        context: Optional[Dict[str, Any]] = None,
+        messages: List[Dict[str, Any]],
+        keep_recent: int = 8,
+        max_tokens_estimate: int = 120000,
     ) -> List[Dict[str, Any]]:
-        """
-        Construct messages for LLM reasoning.
-        
-        Args:
-            instruction: Instruction from Host Agent (card.description or card.title)
-            context: Additional context (workflow state, execution_card, hints, etc.)
-            
-        Returns:
-            List of messages for LLM
-        """
-        messages = [{"role": "system", "content": self._system_prompt}]
-        
-        # 1. Add workflow context
-        if context and "accumulated_context" in context:
-            acc_ctx = context["accumulated_context"]
-            ctx_lines = []
-            
-            # Overall goal
-            original_task = acc_ctx.get('original_task', 'N/A')
-            if original_task and original_task != 'N/A':
-                ctx_lines.append(f"## Overall Goal\n\n{original_task}")
-            
-            # Progress
-            completed = acc_ctx.get('completed_steps', 0)
-            remaining = acc_ctx.get("remaining_executions", [])
-            if remaining:
-                total = completed + len(remaining)
-                ctx_lines.append(f"\n**Progress**: Step {completed + 1}/{total}")
-                
-                # Show next step after current
-                if len(remaining) > 1:
-                    next_step = remaining[1]  # remaining[0] is current, remaining[1] is next
-                    ctx_lines.append(f"**Next After This**: {next_step.get('title', 'unknown')}")
-            
-            # Previous results with data
-            previous_results = acc_ctx.get("previous_results", [])
-            if previous_results:
-                relevant_results = []
-                for result in previous_results[-3:]:  # Last 3 max
-                    if result.get('full_content') or result.get('data'):
-                        relevant_results.append(result)
-                
-                if relevant_results:
-                    ctx_lines.append("\n## Previous Results\n")
-                    for result in relevant_results:
-                        ctx_lines.append(f"- **{result.get('title', 'unknown')}**")
-                        
-                        if result.get('full_content'):
-                            data = result.get('data')
-                            if data:
-                                if isinstance(data, str):
-                                    data_preview = data[:500] if len(data) > 500 else data
-                                    ctx_lines.append(f"    {data_preview}")
-                                    if len(data) > 500:
-                                        ctx_lines.append(f"    ... ({len(data)} chars total)")
-                                else:
-                                    data_str = json.dumps(data, ensure_ascii=False)[:500]
-                                    ctx_lines.append(f"    {data_str}")
-                        elif result.get('summary'):
-                            ctx_lines.append(f"    {result['summary'][:200]}")
-            
-            if ctx_lines:
-                messages.append({
-                    "role": "system",
-                    "content": "\n".join(ctx_lines)
-                })
-        
-        # 2. Add task metadata and completion criteria
-        metadata_lines = []
-        
-        if context:
-            # Get metadata from execution_card
-            if "execution_card" in context:
-                exec_card = context["execution_card"]
-                metadata = exec_card.get("metadata", {})
-                
-                # Step order
-                step_order = metadata.get("step_order")
-                if step_order is not None:
-                    metadata_lines.append(f"**Current Step**: #{step_order}")
-                
-                # Task category hints
-                task_category = metadata.get("task_category")
-                if task_category:
-                    metadata_lines.append(f"**Task Category**: {task_category}")
-                
-                # Backend hints (if Host Agent explicitly provided)
-                backend_hint = metadata.get("preferred_backend") or context.get("preferred_backend")
-                if backend_hint:
-                    metadata_lines.append(f"**Backend Suggestion**: {backend_hint} (Host Agent hint)")
-                
-                # Constraints (if any)
-                constraints = metadata.get("constraints")
-                if constraints:
-                    metadata_lines.append(f"**Constraints**: {constraints}")
-        
-        if metadata_lines:
-            messages.append({
-                "role": "system",
-                "content": "\n".join(metadata_lines)
-            })
-        
-        # 3. Add workspace directory information (if provided)
-        workspace_dir = context.get("workspace_dir") if context else None
-        if workspace_dir:
-            # Construct workspace message
-            workspace_msg = (
-                f"**Workspace Directory**: `{workspace_dir}` (save files directly here, "
-                f"do NOT add /workspace/ subdirectory)"
-            )
-            messages.append({
-                "role": "system",
-                "content": workspace_msg
-            })
-        
-        # Add workspace artifacts information
-        workspace_artifacts = context.get("workspace_artifacts") if context else None
-        if workspace_artifacts and workspace_artifacts.get("has_files"):
-            files_list = ", ".join(workspace_artifacts["files"])
-            
-            # Check if there are matching files that suggest task completion
-            matching_files = workspace_artifacts.get("matching_files", [])
-            recent_files = workspace_artifacts.get("recent_files", [])
-            
-            if matching_files:
-                # Task likely already completed - prompt verification
-                artifact_msg = f"""Workspace Status: Found existing file(s) that may satisfy task requirements: {', '.join(matching_files)}
+        """Truncate message history to prevent context length issues.
 
-Action: First verify if existing files meet the requirements. If yes, report completion. If no, proceed with task execution."""
-            elif len(recent_files) >= 2:
-                # Multiple recent files - suggest checking first
-                artifact_msg = f"""Workspace Status: Found {len(workspace_artifacts['files'])} existing files ({len(recent_files)} recently modified): {files_list}
+        Keeps system messages, the first user instruction, and the most recent
+        *keep_recent* rounds of conversation.
+        """
+        if len(messages) <= keep_recent + 2:  # +2 for system and initial user
+            return messages
 
-Action: Check if existing files already satisfy requirements before creating new ones to avoid redundant work."""
+        total_text = json.dumps(messages, ensure_ascii=False)
+        estimated_tokens = len(total_text) // 4
+
+        if estimated_tokens < max_tokens_estimate:
+            return messages
+
+        logger.info(
+            f"Truncating message history: {len(messages)} messages, "
+            f"~{estimated_tokens:,} tokens -> keeping recent {keep_recent} rounds"
+        )
+
+        system_messages: List[Dict] = []
+        user_instruction: Optional[Dict] = None
+        conversation_messages: List[Dict] = []
+
+        for msg in messages:
+            role = msg.get("role")
+            if role == "system":
+                system_messages.append(msg)
+            elif role == "user" and user_instruction is None:
+                user_instruction = msg
             else:
-                # Standard workspace notification
-                artifact_msg = f"""Workspace Status: Found {len(workspace_artifacts['files'])} existing files: {files_list}
+                conversation_messages.append(msg)
 
-Note: Check existing files before creating new ones if relevant to your task."""
-            
-            messages.append({
-                "role": "system",
-                "content": artifact_msg
-            })
-        
-        #Add related execution history
-        execution_history = context.get("execution_history") if context else None
-        if execution_history:
-            history_lines = ["**Related Task Executions** (previous steps that may have produced useful outputs):"]
-            for i, exec_info in enumerate(execution_history, 1):
-                status_emoji = "✓" if exec_info["status"] == "done" else "✗"
-                history_lines.append(f"{i}. {status_emoji} {exec_info['title']} - {exec_info.get('summary', 'No summary')[:200]}")
-            
-            history_lines.append("\nConsider leveraging outputs from completed tasks above before starting from scratch.")
-            messages.append({
-                "role": "system",
-                "content": "\n".join(history_lines)
-            })
-        
-        # 4. User instruction (most important - comes last)
-        # Note: instruction is card.description or card.title (set by engine)
-        messages.append({"role": "user", "content": instruction})
-        
-        return messages
+        recent_messages = (
+            conversation_messages[-(keep_recent * 2):]
+            if conversation_messages
+            else []
+        )
 
-    async def _check_workspace_artifacts(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Check workspace directory for existing artifacts that might be relevant to the task.
-        Enhanced to detect if task might already be completed.
-        """
-        import os
-        import time
-        workspace_info = {"has_files": False, "files": [], "file_details": {}, "recent_files": []}
-        
-        try:
-            # Get workspace path from recording manager or context
-            workspace_path = None
-            if self._coordinator and self._coordinator.recording_manager:
-                recording_manager = self._coordinator.recording_manager
-                if hasattr(recording_manager, 'workspace_dir'):
-                    workspace_path = recording_manager.workspace_dir
-            
-            # Fallback to context
-            if not workspace_path:
-                workspace_path = context.get("workspace_path")
-            
-            if workspace_path and os.path.exists(workspace_path):
-                files = []
-                current_time = time.time()
-                recent_threshold = 300  # Files modified in last 5 minutes
-                
-                for filename in os.listdir(workspace_path):
-                    filepath = os.path.join(workspace_path, filename)
-                    if os.path.isfile(filepath):
-                        files.append(filename)
-                        # Get file stats
-                        stat = os.stat(filepath)
-                        file_info = {
-                            "size": stat.st_size,
-                            "modified": stat.st_mtime,
-                            "age_seconds": current_time - stat.st_mtime
-                        }
-                        workspace_info["file_details"][filename] = file_info
-                        
-                        # Track recently created/modified files
-                        if file_info["age_seconds"] < recent_threshold:
-                            workspace_info["recent_files"].append(filename)
-                
-                if files:
-                    workspace_info["has_files"] = True
-                    workspace_info["files"] = sorted(files)
-                    logger.info(f"Grounding Agent: Found {len(files)} existing files in workspace "
-                               f"({len(workspace_info['recent_files'])} recent)")
-                    
-                    # Enhanced: Check if instruction mentions specific filenames
-                    instruction = context.get("instruction", "")
-                    if instruction:
-                        # Look for potential file references in instruction
-                        potential_outputs = []
-                        import re
-                        # Match common file patterns: filename.ext, "filename", 'filename'
-                        file_patterns = re.findall(r'["\']?([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)["\']?', instruction)
-                        for pattern in file_patterns:
-                            if pattern in files:
-                                potential_outputs.append(pattern)
-                        
-                        if potential_outputs:
-                            workspace_info["matching_files"] = potential_outputs
-                            logger.info(f"Grounding Agent: Found {len(potential_outputs)} files matching task: {potential_outputs}")
-        
-        except Exception as e:
-            logger.debug(f"Could not check workspace artifacts: {e}")
-        
-        return workspace_info
-    
-    async def _get_related_execution_history(self, context: Dict[str, Any]) -> List[Dict]:
-        """
-        Get history of related executions (sibling executions under same response card).
-        
-        Args:
-            context: Execution context
-            
-        Returns:
-            List of execution results from related tasks
-        """
-        related_history = []
-        
-        try:
-            # Get related executions from context (set by WorkflowEngine)
-            related_executions = context.get("related_executions", [])
-            
-            for exec_info in related_executions:
-                status = exec_info.get("status")
-                # Always include finished or blocked tasks; include errors with concise message for troubleshooting
-                if status in ["done", "blocked", "error"]:
-                    # Prefer 'response' field for normal runs; fall back to 'error' field for failures
-                    result_payload = exec_info.get("result", {}) or {}
+        truncated = system_messages.copy()
+        if user_instruction:
+            truncated.append(user_instruction)
+        truncated.extend(recent_messages)
 
-                    if status == "error":
-                        # Extract error string (may be nested) and truncate
-                        err_msg = result_payload.get("error") or result_payload.get("response", "")
-                        summary = (str(err_msg) or "Unknown error")[:300]
-                    else:
-                        summary = result_payload.get("response", "")[:300]
+        logger.info(
+            f"After truncation: {len(truncated)} messages, "
+            f"~{len(json.dumps(truncated, ensure_ascii=False)) // 4:,} tokens (estimated)"
+        )
 
-                    related_history.append({
-                        "title": exec_info.get("title"),
-                        "status": status,
-                        "summary": summary
-                    })
-            
-            if related_history:
-                logger.info(f"Grounding Agent: Found {len(related_history)} related execution(s)")
-        
-        except Exception as e:
-            logger.debug(f"Could not get related execution history: {e}")
-        
-        return related_history
+        return truncated
+
+    # ------------------------------------------------------------------
+    # Multi-round process
+    # ------------------------------------------------------------------
 
     async def process(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Process an execution request from Host Agent.
-        
-        Args:
-            context: Context dictionary with:
-                - instruction: What to execute
-                - tools: Optional list of tools to use
-                - auto_execute: Whether to auto-execute tools (default True)
-                
-        Returns:
-            Execution result dictionary
+        Process a task execution request with multi-round iteration control.
+
+        The agent iterates up to *max_iterations* times.  Each iteration the
+        LLM may call tools or emit the ``<COMPLETE>`` token to signal the task
+        is done.
         """
         instruction = context.get("instruction", "")
         if not instruction:
             logger.error("Grounding Agent: No instruction provided")
             return {"error": "No instruction provided", "status": "error"}
-        
+
+        # Store current instruction for visual analysis context
+        self._current_instruction = instruction
+
         logger.info(f"Grounding Agent: Processing instruction at step {self.step}")
-        
-        # Check for existing workspace artifacts
+
+        # Check existing workspace files
         workspace_info = await self._check_workspace_artifacts(context)
         if workspace_info["has_files"]:
             context["workspace_artifacts"] = workspace_info
-            logger.info(f"Workspace has {len(workspace_info['files'])} existing files: {workspace_info['files']}")
-        
-        # Get related execution history
-        related_history = await self._get_related_execution_history(context)
-        if related_history:
-            context["execution_history"] = related_history
-            logger.info(f"Found {len(related_history)} related execution(s)")
-        
-        # Get available tools for this task
-        tools = await self._get_tools_for_context(context)
-        
-        # Construct messages for LLM
-        messages = self.construct_messages(instruction, context)
-        
-        # Get LLM response with tools
-        try:
-            response = await self.get_llm_response(
-                messages=messages,
-                tools=tools if context.get("auto_execute", True) else None,
-                execute_tools=context.get("auto_execute", True),
-                max_iterations=context.get("max_iterations", self._max_iterations)
+            logger.info(
+                f"Workspace has {len(workspace_info['files'])} existing files: "
+                f"{workspace_info['files']}"
             )
-            
-            # Process the response
-            result = await self._process_execution_response(response, instruction)
-            
+
+        # Get available tools (auto-search with cap)
+        tools = await self._get_available_tools(instruction)
+
+        # Build retrieved tools list for return value
+        retrieved_tools_list = []
+        for tool in tools:
+            tool_info = {
+                "name": getattr(tool, "name", str(tool)),
+                "description": getattr(tool, "description", ""),
+            }
+            if hasattr(tool, "backend_type"):
+                tool_info["backend"] = (
+                    tool.backend_type.value
+                    if hasattr(tool.backend_type, "value")
+                    else str(tool.backend_type)
+                )
+            if hasattr(tool, "_runtime_info") and tool._runtime_info:
+                tool_info["server_name"] = tool._runtime_info.server_name
+            retrieved_tools_list.append(tool_info)
+
+        # Initialize iteration state
+        max_iterations = context.get("max_iterations", self._max_iterations)
+        current_iteration = 0
+        all_tool_results: List[Dict] = []
+        iteration_contexts: List[Dict] = []
+        consecutive_empty_responses = 0
+        MAX_CONSECUTIVE_EMPTY = 5
+
+        # Build initial messages
+        messages = self.construct_messages(context)
+
+        try:
+            while current_iteration < max_iterations:
+                current_iteration += 1
+                logger.info(
+                    f"Grounding Agent: Iteration {current_iteration}/{max_iterations}"
+                )
+
+                # Truncate message history after 5 iterations
+                if current_iteration >= 5:
+                    messages = self._truncate_messages(
+                        messages,
+                        keep_recent=8,
+                        max_tokens_estimate=120000,
+                    )
+
+                messages_input_snapshot = copy.deepcopy(messages)
+
+                # Call LLMClient for single round with visual analysis callback
+                llm_response = await self._llm_client.complete(
+                    messages=messages,
+                    tools=tools if context.get("auto_execute", True) else None,
+                    execute_tools=context.get("auto_execute", True),
+                    summary_prompt=None,
+                    tool_result_callback=self._visual_analysis_callback,
+                )
+
+                # Update messages with LLM response
+                messages = llm_response["messages"]
+
+                # Collect tool results
+                tool_results_this_iteration = llm_response.get("tool_results", [])
+                if tool_results_this_iteration:
+                    all_tool_results.extend(tool_results_this_iteration)
+
+                assistant_message = llm_response.get("message", {})
+                assistant_content = assistant_message.get("content", "")
+
+                has_tool_calls = llm_response.get("has_tool_calls", False)
+                logger.info(
+                    f"Iteration {current_iteration} - Has tool calls: {has_tool_calls}, "
+                    f"Tool results: {len(tool_results_this_iteration)}, "
+                    f"Content length: {len(assistant_content)} chars"
+                )
+
+                if len(assistant_content) > 0:
+                    logger.info(
+                        f"Iteration {current_iteration} - Assistant content preview: "
+                        f"{repr(assistant_content[:300])}"
+                    )
+                    consecutive_empty_responses = 0
+                else:
+                    if not has_tool_calls:
+                        consecutive_empty_responses += 1
+                        logger.warning(
+                            f"Iteration {current_iteration} - NO tool calls and NO content "
+                            f"(empty response {consecutive_empty_responses}/{MAX_CONSECUTIVE_EMPTY})"
+                        )
+                        if consecutive_empty_responses >= MAX_CONSECUTIVE_EMPTY:
+                            logger.error(
+                                f"Exiting due to {MAX_CONSECUTIVE_EMPTY} consecutive "
+                                "empty LLM responses. This may indicate API issues, "
+                                "rate limiting, or context too long."
+                            )
+                            break
+                    else:
+                        consecutive_empty_responses = 0
+
+                messages_output_snapshot = copy.deepcopy(messages)
+
+                # Record iteration context
+                iteration_context = {
+                    "iteration": current_iteration,
+                    "messages_input": messages_input_snapshot,
+                    "messages_output": messages_output_snapshot,
+                    "llm_response_summary": {
+                        "assistant_content": assistant_content,
+                        "has_tool_calls": has_tool_calls,
+                        "tool_calls_count": len(tool_results_this_iteration),
+                    },
+                }
+                iteration_contexts.append(iteration_context)
+
+                # Check for completion token in assistant content
+                is_complete = GroundingAgentPrompts.TASK_COMPLETE in assistant_content
+
+                if is_complete:
+                    logger.info(
+                        f"Task completed at iteration {current_iteration} "
+                        f"(found {GroundingAgentPrompts.TASK_COMPLETE})"
+                    )
+                    break
+                else:
+                    if tool_results_this_iteration:
+                        logger.debug(
+                            f"Task in progress, LLM called "
+                            f"{len(tool_results_this_iteration)} tools"
+                        )
+                    else:
+                        logger.debug(
+                            "Task in progress, LLM did not generate <COMPLETE>"
+                        )
+
+                    # Remove previous iteration guidance to avoid accumulation
+                    messages = [
+                        msg
+                        for msg in messages
+                        if not (
+                            msg.get("role") == "system"
+                            and "Iteration" in msg.get("content", "")
+                            and "complete" in msg.get("content", "")
+                        )
+                    ]
+
+                    guidance_msg = {
+                        "role": "system",
+                        "content": (
+                            f"Iteration {current_iteration} complete. "
+                            f"Check if task is finished - if yes, output "
+                            f"{GroundingAgentPrompts.TASK_COMPLETE}. "
+                            f"If not, continue with next action."
+                        ),
+                    }
+                    messages.append(guidance_msg)
+                    continue
+
+            # Build final result
+            result = await self._build_final_result(
+                instruction=instruction,
+                messages=messages,
+                all_tool_results=all_tool_results,
+                iterations=current_iteration,
+                max_iterations=max_iterations,
+                iteration_contexts=iteration_contexts,
+                retrieved_tools_list=retrieved_tools_list,
+            )
+
             # Record agent action to recording manager
             if self._coordinator and self._coordinator.recording_manager:
-                # Extract tool execution summary for reasoning
-                tool_summary = []
-                if result.get("tool_executions"):
-                    for exec_info in result["tool_executions"]:
-                        tool_summary.append({
-                            "tool": exec_info.get("tool_name", "unknown"),
-                            "backend": exec_info.get("backend", "unknown"),
-                            "status": exec_info.get("status", "unknown"),
-                        })
-                
-                await self._coordinator.recording_manager.record_agent_action(
-                    agent_name=self.name,
-                    action_type="execute",
-                    input_data={"instruction": instruction},
-                    reasoning={
-                        "response": result.get("response", "")[:500],  # Truncate long responses
-                        "tools_selected": tool_summary,
-                    },
-                    output_data={
-                        "status": result.get("status", "unknown"),
-                        "iterations": result.get("iterations", 0),
-                        "num_tool_executions": len(result.get("tool_executions", [])),
-                    },
-                    metadata={
-                        "step": self.step,
-                        "instruction": instruction,
-                    }
-                )
-            
+                await self._record_agent_execution(result, instruction)
+
             # Increment step
             self.increment_step()
-            
-            logger.info(f"Grounding Agent: Execution completed with status: {result.get('status')}")
+
+            logger.info(
+                f"Grounding Agent: Execution completed with status: "
+                f"{result.get('status')}"
+            )
             return result
-            
+
         except Exception as e:
             logger.error(f"Grounding Agent: Execution failed: {e}")
             result = {
                 "error": str(e),
                 "status": "error",
-                "instruction": instruction
+                "instruction": instruction,
+                "iteration": current_iteration,
             }
             self.increment_step()
             return result
 
-    async def _get_tools_for_context(self, context: Dict[str, Any]) -> List:
+    # ------------------------------------------------------------------
+    # Message construction
+    # ------------------------------------------------------------------
+
+    def construct_messages(
+        self,
+        context: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Build the initial prompt messages from context."""
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": self._system_prompt}
+        ]
+
+        instruction = context.get("instruction", "")
+        if not instruction:
+            raise ValueError("context must contain 'instruction' field")
+
+        # Add workspace directory
+        workspace_dir = context.get("workspace_dir")
+        if workspace_dir:
+            messages.append({
+                "role": "system",
+                "content": GroundingAgentPrompts.workspace_directory(workspace_dir),
+            })
+
+        # Add workspace artifacts information
+        workspace_artifacts = context.get("workspace_artifacts")
+        if workspace_artifacts and workspace_artifacts.get("has_files"):
+            files = workspace_artifacts.get("files", [])
+            matching_files = workspace_artifacts.get("matching_files", [])
+            recent_files = workspace_artifacts.get("recent_files", [])
+
+            if matching_files:
+                artifact_msg = GroundingAgentPrompts.workspace_matching_files(
+                    matching_files
+                )
+            elif len(recent_files) >= 2:
+                artifact_msg = GroundingAgentPrompts.workspace_recent_files(
+                    total_files=len(files),
+                    recent_files=recent_files,
+                )
+            else:
+                artifact_msg = GroundingAgentPrompts.workspace_file_list(files)
+
+            messages.append({"role": "system", "content": artifact_msg})
+
+        # User instruction
+        messages.append({"role": "user", "content": instruction})
+
+        return messages
+
+    # ------------------------------------------------------------------
+    # Tool retrieval (smart search + fallback)
+    # ------------------------------------------------------------------
+
+    async def _get_available_tools(
+        self, task_description: Optional[str]
+    ) -> List:
         """
-        Get all available tools from backend_scope.
-        
-        HostAgent may provide hints (task_category, preferred_backend) which are
-        passed to LLM as context, but GroundingAgent retrieves ALL available tools
-        and lets LLM make the final selection based on actual tool capabilities.
-        
-        Args:
-            context: Execution context with optional hints from HostAgent
-            
-        Returns:
-            List of all tools from backend_scope
+        Retrieve tools with auto-search + cap to control prompt bloat.
+        Falls back to returning all tools if search fails.
         """
         grounding_client = self.grounding_client
         if not grounding_client:
             return []
-        
-        # Retrieve tools from all backends in scope
-        all_tools = []
+
+        backends = [BackendType(name) for name in self._backend_scope]
+
+        try:
+            retrieval_llm = self._tool_retrieval_llm or self._llm_client
+            tools = await grounding_client.get_tools_with_auto_search(
+                task_description=task_description,
+                backend=backends,
+                use_cache=True,
+                llm_callable=retrieval_llm,
+            )
+            logger.info(
+                f"GroundingAgent selected {len(tools)} tools (auto-search) "
+                f"from {len(backends)} backends"
+            )
+            return tools
+        except Exception as e:
+            logger.warning(
+                f"Auto-search tools failed, falling back to full list: {e}"
+            )
+
+        # Fallback: fetch all tools
+        all_tools: List = []
         for backend_name in self._backend_scope:
             try:
                 backend_type = BackendType(backend_name)
                 tools = await grounding_client.list_tools(backend=backend_type)
                 all_tools.extend(tools)
-                logger.debug(f"Retrieved {len(tools)} tools from backend: {backend_name}")
+                logger.debug(
+                    f"Retrieved {len(tools)} tools from backend: {backend_name}"
+                )
             except Exception as e:
                 logger.debug(f"Could not get tools from {backend_name}: {e}")
-        
+
         logger.info(
-            f"GroundingAgent retrieved {len(all_tools)} tools from {len(self._backend_scope)} backends"
+            f"GroundingAgent fallback retrieved {len(all_tools)} tools "
+            f"from {len(self._backend_scope)} backends"
         )
         return all_tools
-    
-    async def _process_execution_response(
+
+    # ------------------------------------------------------------------
+    # Visual analysis callback
+    # ------------------------------------------------------------------
+
+    async def _visual_analysis_callback(
         self,
-        response: Dict[str, Any],
-        instruction: str
-    ) -> Dict[str, Any]:
+        result: ToolResult,
+        tool_name: str,
+        tool_call: Dict,
+        backend: str,
+    ) -> ToolResult:
         """
-        Process LLM execution response.
-        
-        Args:
-            response: LLM response from LLMClient.complete()
-                Format: {
-                    "message": assistant_message,
-                    "tool_results": [{"tool_call": ..., "result": ToolResult, ...}],
-                    "messages": conversation_history,
-                    "iterations": int
-                }
-            instruction: Original instruction
-            
-        Returns:
-            Processed result dictionary
+        Callback for LLMClient to handle visual analysis after tool execution.
+        Only applies to GUI backend results that contain screenshots.
         """
-        # Extract response content
-        result = {
-            "instruction": instruction,
-            "step": self.step,
-            "status": "completed",
-            "iterations": response.get("iterations", 0)
-        }
-        
-        # Check if tools were executed
-        if "tool_results" in response and response["tool_results"]:
-            tool_results = response["tool_results"]
-            result["tool_executions"] = []
-            
-            # Process each tool execution result
-            # tool_results format: [{"tool_call": ..., "result": ToolResult, "backend": ..., "server_name": ...}]
-            for tr in tool_results:
-                tool_result_obj = tr.get("result")  # This is a ToolResult object
-                
-                # Extract tool execution info
-                execution_info = {
-                    "tool_name": tr.get("tool_call", {}).get("function", {}).get("name", "unknown"),
-                    "backend": tr.get("backend"),
-                    "server_name": tr.get("server_name"),
-                    "status": tool_result_obj.status.value if hasattr(tool_result_obj, 'status') else "unknown",
-                    "content": tool_result_obj.content if hasattr(tool_result_obj, 'content') else None,
-                    "error": tool_result_obj.error if hasattr(tool_result_obj, 'error') else None,
-                    "execution_time": tool_result_obj.execution_time if hasattr(tool_result_obj, 'execution_time') else None,
-                    "metadata": tool_result_obj.metadata if hasattr(tool_result_obj, 'metadata') else {},
-                }
-                result["tool_executions"].append(execution_info)
-            
-            # Determine overall status based on tool execution results
-            # Simplified logic:
-            # 1. If last tool call failed -> overall failed
-            # 2. If last tool call succeeded:
-            #    - If no previous failures -> overall succeeded
-            #    - If previous failures exist -> needs evaluation (let EvalAgent decide)
-            
-            # Safety check: ensure tool_results is not empty before accessing last element
-            if tool_results:
-                last_result = tool_results[-1].get("result")
-            else:
-                # Should not happen due to outer check, but be defensive
-                result["status"] = "completed"
-                return result
-            
-            # Check if reached max iterations
-            iterations = response.get("iterations", 0)
-            max_iterations = self._max_iterations
-            reached_max_iterations = (iterations >= max_iterations)
-            
-            # Case 1: Last tool failed -> directly mark as error
-            if hasattr(last_result, 'is_error') and last_result.is_error:
-                result["status"] = "error"
-            else:
-                # Case 2: Last tool succeeded -> check if there were previous failures
-                has_previous_error = any(
-                    hasattr(tr.get("result"), 'is_error') and tr.get("result").is_error
-                    for tr in tool_results[:-1]  # Check all except the last one
-                )
-                
-                # Check if reached max iterations
-                if reached_max_iterations:
-                    # Reached iteration limit - task likely incomplete or stuck in loop
-                    result["status"] = "needs_eval"
-                    result["reason"] = "reached_max_iterations"
-                    result["warning"] = (
-                        f"Task reached max iterations ({max_iterations}) without natural completion. "
-                        f"This usually indicates the task is stuck in a loop or unclear about completion criteria."
-                    )
-                    logger.warning(
-                        f"Grounding Agent: Task reached max iterations ({max_iterations}), "
-                        f"marking as needs_eval for verification"
-                    )
-                elif not has_previous_error:
-                    # No previous failures -> success
-                    result["status"] = "success"
-                else:
-                    # Has previous failures but last succeeded -> needs evaluation
-                    # Let EvalAgent use LLM to intelligently judge if task was completed
-                    result["status"] = "needs_eval"
-                    result["mixed_results"] = True
-                    result["failed_count"] = len([
-                        tr for tr in tool_results[:-1]
-                        if hasattr(tr.get("result"), 'is_error') and tr.get("result").is_error
-                    ])
-            
-            logger.debug(
-                f"Grounding Agent: Processed {len(tool_results)} tool executions, "
-                f"status: {result['status']}"
-            )
-        else:
-            # No tools executed, just LLM response
-            result["status"] = "completed"
-        
-        # Extract final LLM response message
-        if "message" in response:
-            message = response["message"]
-            result["response"] = message.get("content", "")
-        elif "content" in response:
-            result["response"] = response["content"]
-        
-        # Include full conversation history for debugging
-        if "messages" in response:
-            result["conversation_history"] = response["messages"]
-
-        if result.get("tool_executions") and result.get("status") in ["success", "needs_eval"]:
-            try:
-                screenshot_info = await self._extract_screenshots_info(result, instruction)
-                if screenshot_info:
-                    result["screenshot_analysis"] = screenshot_info
-                    logger.debug(f"Screenshot analysis: {screenshot_info[:100]}...")
-            except Exception as e:
-                logger.warning(f"Failed to extract screenshot info: {e}")
-        
-        if result.get("tool_executions") and result.get("status") in ["success", "needs_eval"]:
-            try:
-                llm_response = result.get("response", "")
-                extracted_knowledge = self._parse_llm_summary(llm_response, result)
-                
-                if extracted_knowledge:
-                    result["extracted_knowledge"] = extracted_knowledge
-                    logger.debug(
-                        f"Knowledge extracted from LLM response: what_was_done='{extracted_knowledge.get('what_was_done', 'N/A')[:60]}...', "
-                        f"has_artifact={extracted_knowledge.get('has_artifact', False)}"
-                    )
-                
-            except Exception as e:
-                logger.warning(f"Failed to parse knowledge from LLM response: {e}")
-        
-        # Soft finish: indicate that backend session remains active for potential reuse
-        result["keep_session"] = True
-        return result
-    
-    def _parse_llm_summary(self, llm_response: str, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        import re
-        
-        summary_match = re.search(r'\[SUMMARY\](.*?)(?:\[|$)', llm_response, re.DOTALL | re.IGNORECASE)
-        if not summary_match:
-            logger.debug("No [SUMMARY] section found in LLM response")
-            return None
-        
-        summary_text = summary_match.group(1).strip()
-        
-        what_was_done = ""
-        has_artifact = False
-        artifact_type = ""
-        artifact_source = ""
-        artifact_description = ""
-        
-        what_match = re.search(r'What I did:\s*(.+?)(?:\n|$)', summary_text, re.IGNORECASE)
-        if what_match:
-            what_was_done = what_match.group(1).strip()
-        
-        has_match = re.search(r'Has artifacts:\s*(YES|NO)', summary_text, re.IGNORECASE)
-        if has_match:
-            has_artifact = has_match.group(1).upper() == "YES"
-        
-        if has_artifact:
-            type_match = re.search(r'Artifact type:\s*(.+?)(?:\n|$)', summary_text, re.IGNORECASE)
-            if type_match:
-                artifact_type = type_match.group(1).strip()
-            
-            source_match = re.search(r'Artifact source:\s*(.+?)(?:\n|$)', summary_text, re.IGNORECASE)
-            if source_match:
-                artifact_source = source_match.group(1).strip()
-            
-            desc_match = re.search(r'Artifact description:\s*(.+?)(?:\n|$)', summary_text, re.IGNORECASE)
-            if desc_match:
-                artifact_description = desc_match.group(1).strip()
-        
-        extracted = {
-            "what_was_done": what_was_done or "Executed task",
-            "has_artifact": has_artifact
-        }
-        
-        if has_artifact:
-            artifact_content = None
-            artifact_metadata_extra = {}
-            tool_executions = result.get("tool_executions", [])
-            
-            matched_exec = None
-            if artifact_source:
-                for exec_info in tool_executions:
-                    tool_name = exec_info.get("tool_name", "")
-                    if artifact_source.lower() in tool_name.lower() or tool_name.lower() in artifact_source.lower():
-                        matched_exec = exec_info
-                        artifact_content = exec_info.get("content")
-                        break
-            
-            if matched_exec is None and tool_executions:
-                matched_exec = tool_executions[-1]
-                artifact_content = matched_exec.get("content")
-            
-            # Enhance content with screenshot analysis if available
-            screenshot_analysis = result.get("screenshot_analysis")
-            if screenshot_analysis:
-                if artifact_content:
-                    artifact_content = f"{artifact_content}\n\nScreenshot Analysis:\n{screenshot_analysis}"
-                else:
-                    artifact_content = f"Screenshot Analysis:\n{screenshot_analysis}"
-            
-            if matched_exec:
-                exec_metadata = matched_exec.get("metadata", {})
-                backend = matched_exec.get("backend", "unknown")
-                
-                if "screenshot" in exec_metadata:
-                    artifact_metadata_extra["screenshot"] = exec_metadata["screenshot"]
-                    artifact_metadata_extra["needs_vlm_analysis"] = True
-                    logger.debug("GUI artifact: screenshot saved to metadata")
-                
-                if "action_history" in exec_metadata:
-                    artifact_metadata_extra["action_history"] = exec_metadata["action_history"]
-                
-                if "code_history" in exec_metadata:
-                    artifact_metadata_extra["code_history"] = exec_metadata["code_history"]
-                    artifact_metadata_extra["needs_code_history_analysis"] = True
-                    logger.debug(f"Shell artifact: code_history with {len(exec_metadata['code_history'])} steps saved")
-                
-                if "raw" in exec_metadata:
-                    artifact_metadata_extra["raw_data"] = exec_metadata["raw"]
-                    artifact_metadata_extra["needs_structure_preservation"] = True
-                    logger.debug("MCP artifact: raw structured data saved")
-            
-            backends_used = [exec_info.get("backend", "unknown") for exec_info in tool_executions]
-            primary_backend = backends_used[-1] if backends_used else "unknown"
-            
-            extracted["artifact"] = {
-                "type": artifact_type or "execution_output",
-                "content": artifact_content,
-                "description": artifact_description or "Execution artifact",
-                "metadata": {
-                    "backend": primary_backend,
-                    "source": artifact_source,
-                    "tools_used": [e.get("tool_name") for e in tool_executions],
-                    **artifact_metadata_extra 
-                }
-            }
-        
-        logger.debug(f"Parsed LLM summary: what_was_done='{what_was_done[:60]}', has_artifact={has_artifact}")
-        return extracted
-    
-    async def _extract_screenshots_info(
-        self, 
-        result: Dict[str, Any], 
-        instruction: str,
-        max_screenshots: int = 3
-    ) -> Optional[str]:
-        """
-        Extract key information from screenshots.
-
-        Args:
-            result: Execution result containing tool_executions
-            instruction: The task instruction
-            max_screenshots: Maximum number of screenshots to analyze (default: 3)
-        """
-        import base64
-
-        screenshots = []
-        for i, exec_info in enumerate(result.get("tool_executions", [])):
-            backend = exec_info.get("backend", "unknown")
-            metadata = exec_info.get("metadata", {})
-
-            if "screenshot" in metadata and metadata["screenshot"]:
-                screenshots.append({
-                    "index": i,
-                    "tool_name": exec_info.get("tool_name", "unknown"),
-                    "screenshot": metadata["screenshot"],
-                    "content": exec_info.get("content", ""),
-                    "backend": backend
-                })
-                logger.debug(f"Found screenshot from {backend} backend: {exec_info.get('tool_name')}")
-        
-        if not screenshots:
-            return None
-        
-        logger.info(f"Found {len(screenshots)} screenshots to analyze")
-        
-        # If too many screenshots, intelligently select key ones
-        selected_screenshots = self._select_key_screenshots(screenshots, max_screenshots)
-        
-        logger.info(f"Selected {len(selected_screenshots)} screenshots for VLM analysis")
-        
-        # Prepare content for VLM
-        content_parts = []
-        
-        # Add instruction context
-        prompt = f"""Task: {instruction}
-
-Analyze the following screenshot(s) and extract KEY CONTENT INFORMATION:
-
-**What to EXTRACT**:
-1. **Specific data/numbers**: counts, statistics, measurements, quantities
-2. **Important text**: titles, names, messages, labels, descriptions
-3. **Content items**: what lists/tables/cards contain (their actual content)
-4. **Status/state**: indicators that convey information (badges, alerts)
-
-**What to IGNORE**:
-- UI elements: buttons, menus, icons, layouts
-- Design: colors, fonts, spacing (unless they convey meaning)
-- Navigation: headers, footers, sidebars
-- Decorative elements
-
-**Format**: Be SPECIFIC and FACTUAL. Report exact numbers and text you see.
-
-{"Screenshots to analyze:" if len(selected_screenshots) > 1 else "Screenshot to analyze:"}
-"""
-        
-        content_parts.append({"type": "text", "text": prompt})
-        
-        # Add each selected screenshot
-        for i, ss in enumerate(selected_screenshots, 1):
-            screenshot_b64 = base64.b64encode(ss["screenshot"]).decode('utf-8')
-            
-            # Add context for this screenshot
-            context = f"\n--- Screenshot {i}"
-            if len(selected_screenshots) > 1:
-                context += f" (from {ss['tool_name']})"
-            context += " ---"
-            content_parts.append({"type": "text", "text": context})
-            
-            # Add the screenshot
-            content_parts.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/png;base64,{screenshot_b64}"
-                }
-            })
-        
-        # Add final instruction
-        final_instruction = "\n\nProvide a concise summary (3-5 sentences) of the KEY CONTENT INFORMATION visible across all screenshots:"
-        content_parts.append({"type": "text", "text": final_instruction})
-        
+        # 1. Check if LLM requested to skip visual analysis
+        skip_visual_analysis = False
         try:
-            # Call VLM to analyze
-            response = await self.get_llm_response(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": content_parts
-                    }
-                ],
-                tools=None,  # No tools for this extraction call
-                max_tokens=300
-            )
-            
-            extracted_info = response["message"]["content"].strip()
-            logger.info(f"Successfully extracted screenshot info: {extracted_info[:100]}...")
-            
-            return extracted_info
-            
+            arguments = tool_call.function.arguments
+            if isinstance(arguments, str):
+                args = json.loads(arguments.strip() or "{}")
+            else:
+                args = arguments
+
+            if isinstance(args, dict) and args.get("skip_visual_analysis"):
+                skip_visual_analysis = True
+                logger.info(
+                    f"Visual analysis skipped for {tool_name} "
+                    "(meta-parameter set by LLM)"
+                )
         except Exception as e:
-            logger.error(f"Failed to extract screenshot info: {e}", exc_info=True)
-            return None
-    
+            logger.debug(f"Could not parse tool arguments: {e}")
+
+        if skip_visual_analysis:
+            return result
+
+        # 2. Only apply to GUI backend
+        if backend != "gui":
+            return result
+
+        # 3. Check if tool has visual data
+        metadata = getattr(result, "metadata", None)
+        has_screenshots = metadata and (
+            metadata.get("screenshot") or metadata.get("screenshots")
+        )
+
+        # 4. If no visual data, try to capture a screenshot
+        if not has_screenshots:
+            try:
+                logger.info(
+                    f"No visual data from {tool_name}, capturing screenshot..."
+                )
+                screenshot_client = ScreenshotClient()
+                screenshot_bytes = await screenshot_client.capture()
+
+                if screenshot_bytes:
+                    if metadata is None:
+                        result.metadata = {}
+                        metadata = result.metadata
+                    metadata["screenshot"] = screenshot_bytes
+                    has_screenshots = True
+                    logger.info("Screenshot captured for visual analysis")
+                else:
+                    logger.warning("Failed to capture screenshot")
+            except Exception as e:
+                logger.warning(f"Error capturing screenshot: {e}")
+
+        # 5. If still no screenshots, return original result
+        if not has_screenshots:
+            logger.debug(f"No visual data available for {tool_name}")
+            return result
+
+        # 6. Perform visual analysis
+        return await self._enhance_result_with_visual_context(result, tool_name)
+
+    async def _enhance_result_with_visual_context(
+        self,
+        result: ToolResult,
+        tool_name: str,
+    ) -> ToolResult:
+        """Enhance tool result with visual analysis for grounding agent workflows."""
+        import asyncio
+        import base64
+        import litellm
+
+        try:
+            metadata = getattr(result, "metadata", None)
+            if not metadata:
+                return result
+
+            # Collect all screenshots
+            screenshots_bytes: List[bytes] = []
+
+            if metadata.get("screenshots"):
+                screenshots_list = metadata["screenshots"]
+                if isinstance(screenshots_list, list):
+                    screenshots_bytes = [s for s in screenshots_list if s]
+            elif metadata.get("screenshot"):
+                screenshots_bytes = [metadata["screenshot"]]
+
+            if not screenshots_bytes:
+                return result
+
+            # Select key screenshots if there are too many
+            selected_screenshots = self._select_key_screenshots(
+                screenshots_bytes, max_count=3
+            )
+
+            # Convert to base64
+            visual_b64_list: List[str] = []
+            for visual_data in selected_screenshots:
+                if isinstance(visual_data, bytes):
+                    visual_b64_list.append(
+                        base64.b64encode(visual_data).decode("utf-8")
+                    )
+                else:
+                    visual_b64_list.append(visual_data)
+
+            num_screenshots = len(visual_b64_list)
+
+            prompt = GroundingAgentPrompts.visual_analysis(
+                tool_name=tool_name,
+                num_screenshots=num_screenshots,
+                task_description=getattr(self, "_current_instruction", ""),
+            )
+
+            content: List[Dict] = [{"type": "text", "text": prompt}]
+            for visual_b64 in visual_b64_list:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{visual_b64}"},
+                })
+
+            visual_model = self._visual_analysis_model or (
+                self._llm_client.model
+                if self._llm_client
+                else "openrouter/anthropic/claude-sonnet-4.5"
+            )
+            response = await asyncio.wait_for(
+                litellm.acompletion(
+                    model=visual_model,
+                    messages=[{"role": "user", "content": content}],
+                    timeout=self._visual_analysis_timeout,
+                ),
+                timeout=self._visual_analysis_timeout + 5,
+            )
+
+            analysis = response.choices[0].message.content.strip()
+
+            original_content = result.content or "(no text output)"
+            enhanced_content = (
+                f"{original_content}\n\n**Visual content**: {analysis}"
+            )
+
+            enhanced_result = ToolResult(
+                status=result.status,
+                content=enhanced_content,
+                error=result.error,
+                metadata={
+                    **metadata,
+                    "visual_analyzed": True,
+                    "visual_analysis": analysis,
+                },
+                execution_time=result.execution_time,
+            )
+
+            logger.info(
+                f"Enhanced {tool_name} result with visual analysis "
+                f"({num_screenshots} screenshot(s))"
+            )
+            return enhanced_result
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Visual analysis timed out for {tool_name}, returning original result"
+            )
+            return result
+        except Exception as e:
+            logger.warning(
+                f"Failed to analyze visual content for {tool_name}: {e}"
+            )
+            return result
+
+    # ------------------------------------------------------------------
+    # Screenshot selection helper
+    # ------------------------------------------------------------------
+
     def _select_key_screenshots(
-        self, 
-        screenshots: List[Dict], 
-        max_count: int
-    ) -> List[Dict]:
-        """
-        Intelligently select key screenshots if there are too many.
-        """
+        self,
+        screenshots: List[bytes],
+        max_count: int = 3,
+    ) -> List[bytes]:
+        """Select key screenshots if there are too many."""
         if len(screenshots) <= max_count:
             return screenshots
-        
-        selected_indices = set()
-        
+
+        selected_indices: set = set()
+
         # Always include last (final state)
         selected_indices.add(len(screenshots) - 1)
-        
+
         # If room, include first (initial state)
         if max_count >= 2:
             selected_indices.add(0)
-        
+
         # Fill remaining slots with evenly spaced middle screenshots
         remaining_slots = max_count - len(selected_indices)
         if remaining_slots > 0:
-            # Calculate spacing
             available_indices = [
-                i for i in range(1, len(screenshots) - 1)
+                i
+                for i in range(1, len(screenshots) - 1)
                 if i not in selected_indices
             ]
-            
+
             if available_indices:
                 step = max(1, len(available_indices) // (remaining_slots + 1))
                 for i in range(remaining_slots):
                     idx = min((i + 1) * step, len(available_indices) - 1)
                     if idx < len(available_indices):
                         selected_indices.add(available_indices[idx])
-        
-        # Return screenshots in original order
+
         selected = [screenshots[i] for i in sorted(selected_indices)]
-        
         logger.debug(
-            f"Selected screenshots at indices {sorted(selected_indices)} "
-            f"from total of {len(screenshots)}"
+            f"Selected {len(selected)} screenshots at indices "
+            f"{sorted(selected_indices)} from total of {len(screenshots)}"
         )
-        
         return selected
+
+    # ------------------------------------------------------------------
+    # Workspace helpers
+    # ------------------------------------------------------------------
+
+    def _get_workspace_path(self, context: Dict[str, Any]) -> Optional[str]:
+        """Get workspace directory path from context or recording manager."""
+        workspace_path = context.get("workspace_dir")
+        if workspace_path:
+            return workspace_path
+
+        # Try to get from recording manager
+        if self._coordinator and self._coordinator.recording_manager:
+            rm = self._coordinator.recording_manager
+            if hasattr(rm, "workspace_dir"):
+                return rm.workspace_dir
+
+        return None
+
+    def _scan_workspace_files(
+        self,
+        workspace_path: Optional[str],
+        recent_threshold: int = 600,
+    ) -> Dict[str, Any]:
+        """Scan workspace directory and collect file information."""
+        import os
+        import time
+
+        result: Dict[str, Any] = {
+            "files": [],
+            "file_details": {},
+            "recent_files": [],
+        }
+
+        if not workspace_path or not os.path.exists(workspace_path):
+            return result
+
+        # Recording system files to exclude from workspace scanning
+        excluded_files = {"metadata.json", "traj.jsonl"}
+
+        try:
+            current_time = time.time()
+
+            for filename in os.listdir(workspace_path):
+                filepath = os.path.join(workspace_path, filename)
+                if os.path.isfile(filepath) and filename not in excluded_files:
+                    result["files"].append(filename)
+                    stat = os.stat(filepath)
+                    file_info = {
+                        "size": stat.st_size,
+                        "modified": stat.st_mtime,
+                        "age_seconds": current_time - stat.st_mtime,
+                    }
+                    result["file_details"][filename] = file_info
+                    if file_info["age_seconds"] < recent_threshold:
+                        result["recent_files"].append(filename)
+
+            result["files"] = sorted(result["files"])
+
+        except Exception as e:
+            logger.debug(f"Error scanning workspace files: {e}")
+
+        return result
+
+    async def _check_workspace_artifacts(
+        self, context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Check workspace directory for existing artifacts."""
+        import re
+
+        workspace_info: Dict[str, Any] = {
+            "has_files": False,
+            "files": [],
+            "file_details": {},
+            "recent_files": [],
+        }
+
+        try:
+            workspace_path = self._get_workspace_path(context)
+            scan_result = self._scan_workspace_files(
+                workspace_path, recent_threshold=600
+            )
+
+            if scan_result["files"]:
+                workspace_info["has_files"] = True
+                workspace_info["files"] = scan_result["files"]
+                workspace_info["file_details"] = scan_result["file_details"]
+                workspace_info["recent_files"] = scan_result["recent_files"]
+
+                logger.info(
+                    f"Grounding Agent: Found {len(scan_result['files'])} "
+                    f"existing files in workspace "
+                    f"({len(scan_result['recent_files'])} recent)"
+                )
+
+                # Check if instruction mentions specific filenames
+                instruction = context.get("instruction", "")
+                if instruction:
+                    potential_outputs = []
+                    file_patterns = re.findall(
+                        r'["\']?([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)["\']?',
+                        instruction,
+                    )
+                    for pattern in file_patterns:
+                        if pattern in scan_result["files"]:
+                            potential_outputs.append(pattern)
+
+                    if potential_outputs:
+                        workspace_info["matching_files"] = potential_outputs
+                        logger.info(
+                            f"Grounding Agent: Found {len(potential_outputs)} "
+                            f"files matching task: {potential_outputs}"
+                        )
+
+        except Exception as e:
+            logger.debug(f"Could not check workspace artifacts: {e}")
+
+        return workspace_info
+
+    # ------------------------------------------------------------------
+    # Backend descriptions (used by HostAgent for planning context)
+    # ------------------------------------------------------------------
+
+    async def get_backend_descriptions(self) -> Dict[str, str]:
+        """
+        Get descriptions of all available backends, their servers, and tools.
+
+        For MCP backend, groups tools by server to help HostAgent understand
+        which server provides which capabilities.
+        """
+        grounding_client = self.grounding_client
+        if not grounding_client:
+            logger.warning("Grounding Agent: No grounding client available")
+            return {}
+
+        descriptions: Dict[str, str] = {}
+
+        try:
+            for backend_name in self._backend_scope:
+                try:
+                    if backend_name == "system":
+                        descriptions[backend_name] = (
+                            "System tools for querying backend capabilities"
+                        )
+                        continue
+
+                    backend_type = BackendType(backend_name)
+                    tools = await grounding_client.list_tools(
+                        backend=backend_type
+                    )
+
+                    if not tools:
+                        descriptions[backend_name] = (
+                            f"Backend '{backend_name}' available but no tools found"
+                        )
+                        continue
+
+                    # Group tools by server
+                    server_tools: Dict[Optional[str], List] = {}
+                    for tool in tools:
+                        server_name = (
+                            getattr(tool.runtime_info, "server_name", None)
+                            if hasattr(tool, "runtime_info")
+                            else None
+                        )
+                        server_tools.setdefault(server_name, []).append(tool)
+
+                    desc_lines: List[str] = []
+
+                    good_for_map = {
+                        "shell": "File operations, command execution, system tasks",
+                        "gui": "GUI automation, browser control, visual interactions",
+                        "mcp": "Application control via MCP servers",
+                        "web": "Web search, information gathering",
+                        "system": "Querying system capabilities",
+                    }
+
+                    if backend_name.lower() == "mcp":
+                        desc_lines.append(
+                            f"MCP Backend ({len(tools)} total tools across "
+                            f"{len(server_tools)} servers)"
+                        )
+                        desc_lines.append(
+                            f"Good for: {good_for_map.get(backend_name.lower(), 'Various tasks')}"
+                        )
+
+                        for srv_name, srv_tools in server_tools.items():
+                            srv_display = srv_name or "<default>"
+                            desc_lines.append(
+                                f"\n  Server: {srv_display} ({len(srv_tools)} tools)"
+                            )
+                            tool_names = [t.schema.name for t in srv_tools]
+                            desc_lines.append(
+                                f"    Tools: {', '.join(tool_names[:8])}"
+                            )
+                            if len(tool_names) > 8:
+                                desc_lines.append(
+                                    f"           {', '.join(tool_names[8:16])}"
+                                )
+                                if len(tool_names) > 16:
+                                    desc_lines.append(
+                                        f"           (and {len(tool_names) - 16} more)"
+                                    )
+                            examples = srv_tools[:3]
+                            if examples:
+                                desc_lines.append("    Example capabilities:")
+                                for t in examples:
+                                    td = t.schema.description or "No description"
+                                    if len(td) > 80:
+                                        td = td[:77] + "..."
+                                    desc_lines.append(
+                                        f"      - {t.schema.name}: {td}"
+                                    )
+                    else:
+                        desc_lines.append(
+                            f"{backend_name.upper()} Backend ({len(tools)} tools)"
+                        )
+                        desc_lines.append(
+                            f"Good for: {good_for_map.get(backend_name.lower(), 'Various tasks')}"
+                        )
+                        tool_names = [t.schema.name for t in tools]
+                        desc_lines.append(
+                            f"  Tools: {', '.join(tool_names[:10])}"
+                        )
+                        if len(tool_names) > 10:
+                            desc_lines.append(
+                                f"         {', '.join(tool_names[10:20])}"
+                            )
+                            if len(tool_names) > 20:
+                                desc_lines.append(
+                                    f"         (and {len(tool_names) - 20} more)"
+                                )
+                        examples = tools[:3]
+                        if examples:
+                            desc_lines.append("  Example capabilities:")
+                            for t in examples:
+                                td = t.schema.description or "No description"
+                                if len(td) > 80:
+                                    td = td[:77] + "..."
+                                desc_lines.append(f"    - {t.schema.name}: {td}")
+
+                    descriptions[backend_name] = "\n".join(desc_lines)
+                    logger.debug(
+                        f"Backend {backend_name}: {len(tools)} tools "
+                        f"across {len(server_tools)} servers"
+                    )
+
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to get description for backend {backend_name}: {e}"
+                    )
+                    descriptions[backend_name] = (
+                        f"Backend available but description unavailable: {e}"
+                    )
+
+            logger.info(
+                f"Grounding Agent: Retrieved descriptions for "
+                f"{len(descriptions)} backends"
+            )
+            return descriptions
+
+        except Exception as e:
+            logger.error(
+                f"Grounding Agent: Failed to get backend descriptions: {e}"
+            )
+            return {"error": f"Failed to retrieve backend descriptions: {e}"}
+
+    # ------------------------------------------------------------------
+    # Result building & helpers
+    # ------------------------------------------------------------------
+
+    async def _build_final_result(
+        self,
+        instruction: str,
+        messages: List[Dict],
+        all_tool_results: List[Dict],
+        iterations: int,
+        max_iterations: int,
+        iteration_contexts: Optional[List[Dict]] = None,
+        retrieved_tools_list: Optional[List[Dict]] = None,
+    ) -> Dict[str, Any]:
+        """Build final execution result after all iterations."""
+        is_complete = self._check_task_completion(messages)
+        tool_executions = self._format_tool_executions(all_tool_results)
+
+        result: Dict[str, Any] = {
+            "instruction": instruction,
+            "step": self.step,
+            "iterations": iterations,
+            "tool_executions": tool_executions,
+            "messages": messages,
+            "iteration_contexts": iteration_contexts or [],
+            "retrieved_tools_list": retrieved_tools_list or [],
+            "keep_session": True,
+        }
+
+        if is_complete:
+            logger.info("Task completed with <COMPLETE> marker")
+            last_response = self._extract_last_assistant_message(messages)
+            result["response"] = last_response.replace(
+                GroundingAgentPrompts.TASK_COMPLETE, ""
+            ).strip()
+            result["status"] = "success"
+        else:
+            result["response"] = self._extract_last_assistant_message(messages)
+            result["status"] = "incomplete"
+            result["warning"] = (
+                f"Task reached max iterations ({max_iterations}) without completion. "
+                "This may indicate the task needs more steps or clarification."
+            )
+
+        return result
+
+    def _format_tool_executions(
+        self, all_tool_results: List[Dict]
+    ) -> List[Dict]:
+        """Format raw tool results into a structured list."""
+        executions: List[Dict] = []
+        for tr in all_tool_results:
+            tool_result_obj = tr.get("result")
+            tool_call = tr.get("tool_call")
+
+            status = "unknown"
+            if hasattr(tool_result_obj, "status"):
+                status_obj = tool_result_obj.status
+                status = getattr(status_obj, "value", status_obj)
+
+            # Extract tool_name and arguments from tool_call object
+            tool_name = "unknown"
+            arguments: Dict = {}
+            if tool_call is not None:
+                if hasattr(tool_call, "function"):
+                    tool_name = getattr(tool_call.function, "name", "unknown")
+                    args_raw = getattr(tool_call.function, "arguments", "{}")
+                    if isinstance(args_raw, str):
+                        try:
+                            arguments = (
+                                json.loads(args_raw) if args_raw.strip() else {}
+                            )
+                        except json.JSONDecodeError:
+                            arguments = {}
+                    else:
+                        arguments = (
+                            args_raw if isinstance(args_raw, dict) else {}
+                        )
+                elif isinstance(tool_call, dict):
+                    func = tool_call.get("function", {})
+                    tool_name = func.get("name", "unknown")
+                    args_raw = func.get("arguments", "{}")
+                    if isinstance(args_raw, str):
+                        try:
+                            arguments = (
+                                json.loads(args_raw) if args_raw.strip() else {}
+                            )
+                        except json.JSONDecodeError:
+                            arguments = {}
+                    else:
+                        arguments = (
+                            args_raw if isinstance(args_raw, dict) else {}
+                        )
+
+            executions.append({
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "backend": tr.get("backend"),
+                "server_name": tr.get("server_name"),
+                "status": status,
+                "content": (
+                    tool_result_obj.content
+                    if hasattr(tool_result_obj, "content")
+                    else None
+                ),
+                "error": (
+                    tool_result_obj.error
+                    if hasattr(tool_result_obj, "error")
+                    else None
+                ),
+                "execution_time": (
+                    tool_result_obj.execution_time
+                    if hasattr(tool_result_obj, "execution_time")
+                    else None
+                ),
+                "metadata": (
+                    tool_result_obj.metadata
+                    if hasattr(tool_result_obj, "metadata")
+                    else {}
+                ),
+            })
+        return executions
+
+    def _check_task_completion(self, messages: List[Dict]) -> bool:
+        """Check whether the last assistant message contains the completion token."""
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                return GroundingAgentPrompts.TASK_COMPLETE in content
+        return False
+
+    def _extract_last_assistant_message(self, messages: List[Dict]) -> str:
+        """Extract the content of the last assistant message."""
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                return msg.get("content", "")
+        return ""
+
+    # ------------------------------------------------------------------
+    # Iteration feedback helpers (kept for future re-enabling)
+    # ------------------------------------------------------------------
+
+    def _build_iteration_feedback(
+        self,
+        iteration: int,
+        llm_summary: Optional[str] = None,
+        add_guidance: bool = True,
+    ) -> Optional[Dict[str, str]]:
+        """Build feedback message to add to next iteration."""
+        if not llm_summary:
+            return None
+
+        feedback_content = GroundingAgentPrompts.iteration_feedback(
+            iteration=iteration,
+            llm_summary=llm_summary,
+            add_guidance=add_guidance,
+        )
+        return {"role": "system", "content": feedback_content}
+
+    def _remove_previous_guidance(
+        self, messages: List[Dict[str, Any]]
+    ) -> None:
+        """Remove guidance section from previous iteration feedback messages."""
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg.get("content", "")
+                if (
+                    "## Iteration" in content
+                    and "Summary" in content
+                    and "---" in content
+                ):
+                    summary_only = content.split("---")[0].strip()
+                    msg["content"] = summary_only
+
+    async def _generate_final_summary(
+        self,
+        instruction: str,
+        messages: List[Dict],
+        iterations: int,
+    ) -> tuple:
+        """
+        Generate final summary across all iterations (disabled by default).
+
+        Returns:
+            tuple[str, bool, List[Dict]]: (summary_text, success_flag, context_used)
+        """
+        final_summary_prompt = {
+            "role": "user",
+            "content": GroundingAgentPrompts.final_summary(
+                instruction=instruction,
+                iterations=iterations,
+            ),
+        }
+
+        clean_messages: List[Dict] = []
+        for msg in messages:
+            if msg.get("role") == "tool":
+                continue
+            clean_msg = msg.copy()
+            if "tool_calls" in clean_msg:
+                del clean_msg["tool_calls"]
+            clean_messages.append(clean_msg)
+
+        clean_messages.append(final_summary_prompt)
+        context_for_return = copy.deepcopy(clean_messages)
+
+        try:
+            summary_response = await self._llm_client.complete(
+                messages=clean_messages,
+                tools=None,
+                execute_tools=False,
+            )
+            final_summary = summary_response.get("message", {}).get(
+                "content", ""
+            )
+
+            if final_summary:
+                logger.info(
+                    f"Generated final summary: {final_summary[:200]}..."
+                )
+                return final_summary, True, context_for_return
+            else:
+                logger.warning("LLM returned empty final summary")
+                return (
+                    f"Task completed after {iterations} iteration(s). "
+                    "Check execution history for details.",
+                    True,
+                    context_for_return,
+                )
+
+        except Exception as e:
+            logger.error(f"Error generating final summary: {e}")
+            return (
+                f"Task completed after {iterations} iteration(s), "
+                f"but failed to generate summary: {str(e)}",
+                False,
+                context_for_return,
+            )
+
+    # ------------------------------------------------------------------
+    # Recording helper
+    # ------------------------------------------------------------------
+
+    async def _record_agent_execution(
+        self,
+        result: Dict[str, Any],
+        instruction: str,
+    ) -> None:
+        """Record agent execution to recording manager."""
+        recording_manager = self.recording_manager
+        if not recording_manager:
+            return
+
+        tool_summary = []
+        if result.get("tool_executions"):
+            for exec_info in result["tool_executions"]:
+                tool_summary.append({
+                    "tool": exec_info.get("tool_name", "unknown"),
+                    "backend": exec_info.get("backend", "unknown"),
+                    "status": exec_info.get("status", "unknown"),
+                })
+
+        await recording_manager.record_agent_action(
+            agent_name=self.name,
+            action_type="execute",
+            input_data={"instruction": instruction},
+            reasoning={
+                "response": result.get("response", ""),
+                "tools_selected": tool_summary,
+            },
+            output_data={
+                "status": result.get("status", "unknown"),
+                "iterations": result.get("iterations", 0),
+                "num_tool_executions": len(
+                    result.get("tool_executions", [])
+                ),
+            },
+            metadata={
+                "step": self.step,
+                "instruction": instruction,
+            },
+        )

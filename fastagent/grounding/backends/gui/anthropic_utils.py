@@ -203,7 +203,8 @@ def response_to_params(response: BetaMessage) -> List[BetaContentBlockParam]:
     if response.content:
         for block in response.content:
             # Check block type using type attribute
-            block_type = getattr(block, "type", None)
+            # Note: type may be a string or enum, so convert to string for comparison
+            block_type = str(getattr(block, "type", ""))
             
             if block_type == "text":
                 # Regular text block
@@ -219,8 +220,15 @@ def response_to_params(response: BetaMessage) -> List[BetaContentBlockParam]:
                     thinking_block["signature"] = getattr(block, "signature", None)
                 res.append(cast(BetaContentBlockParam, thinking_block))
             elif block_type == "tool_use":
-                # Tool use block
-                res.append(cast(BetaToolUseBlockParam, block.model_dump()))
+                # Tool use block - only include required fields to avoid API errors
+                # (e.g., 'caller' field is not permitted by Anthropic API)
+                tool_use_dict = {
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                }
+                res.append(cast(BetaToolUseBlockParam, tool_use_dict))
             else:
                 # Unknown block type - try to handle generically
                 try:

@@ -80,11 +80,23 @@ def load_config(*config_paths: Union[str, Path]) -> GroundingConfig:
         raw_data = _load_multiple_files(paths)
         
         # Load MCP configuration (separate processing)
-        mcp_data = _load_json_file(CONFIG_DIR / CONFIG_MCP)
-        if mcp_data and "mcpServers" in mcp_data:
+        # Check if mcpServers already provided in merged custom configs
+        has_custom_mcp_servers = "mcpServers" in raw_data
+        
+        if has_custom_mcp_servers:
+            # Use mcpServers from custom config
             if "mcp" not in raw_data:
                 raw_data["mcp"] = {}
-            raw_data["mcp"]["servers"] = mcp_data["mcpServers"]
+            raw_data["mcp"]["servers"] = raw_data.pop("mcpServers")
+            logger.debug(f"Using custom MCP servers from provided config ({len(raw_data['mcp']['servers'])} servers)")
+        else:
+            # Load default MCP servers from config_mcp.json
+            mcp_data = _load_json_file(CONFIG_DIR / CONFIG_MCP)
+            if mcp_data and "mcpServers" in mcp_data:
+                if "mcp" not in raw_data:
+                    raw_data["mcp"] = {}
+                raw_data["mcp"]["servers"] = mcp_data["mcpServers"]
+                logger.debug(f"Loaded MCP servers from default config_mcp.json ({len(raw_data['mcp']['servers'])} servers)")
         
         # Validate and create configuration object
         try:

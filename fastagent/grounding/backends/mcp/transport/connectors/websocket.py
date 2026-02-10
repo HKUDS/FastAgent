@@ -4,7 +4,6 @@ WebSocket connector for MCP implementations.
 This module provides a connector for communicating with MCP implementations
 through WebSocket connections.
 """
-
 import asyncio
 import json
 import uuid

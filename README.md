@@ -290,6 +290,7 @@ FastAgent/
 │   │       └── web/                      # Web search & browsing
 │   │
 │   ├── ⚡ memory/                         # Memory & Storage
+│   ├── ⚡ prompts/                        # Centralized Agent Prompts
 │   ├── 🔧 llm/                           # LLM Integration
 │   ├── 🔧 config/                        # Configuration System 
 │   ├── 🔧 local_server/                  # GUI Backend Server 
@@ -379,6 +380,12 @@ grounding/core/
 │   ├── local_tool.py               # Local tool implementation
 │   └── remote_tool.py              # Remote tool implementation
 │
+├── quality/                        # Tool quality tracking & evolution
+│   ├── __init__.py                 # Global quality manager access
+│   ├── types.py                    # ExecutionRecord, DescriptionQuality
+│   ├── store.py                    # Persistent JSON storage
+│   └── manager.py                  # Quality tracking, ranking adjustment
+│
 ├── security/                       # Security & sandboxing 🔧
 │   ├── policies.py                 # Security policy enforcement
 │   ├── sandbox.py                  # Sandbox abstraction
@@ -443,6 +450,7 @@ backends/mcp/
 ├── config.py                       # MCP configuration loader
 ├── installer.py                    # MCP server installer
 ├── tool_converter.py               # Convert MCP tools to unified format
+├── tool_cache.py                   # MCP tool metadata caching
 └── transport/
     ├── connectors/                 # Multiple transport types
     │   ├── base.py
@@ -487,6 +495,21 @@ memory/
 ```
 
 **Key Responsibilities**: Multi-level storage, context compression, and historical awareness.
+
+</details>
+
+<details open>
+<summary><b>⚡ prompts/</b> - Centralized Agent Prompts</summary>
+
+```
+prompts/
+├── __init__.py
+├── grounding_agent_prompts.py     # GroundingAgent system & iteration prompts
+├── host_agent_prompts.py          # HostAgent planning prompts
+└── eval_agent_prompts.py          # EvalAgent evaluation prompts
+```
+
+**Key Responsibilities**: Centralized prompt management for all agents, including system prompts, iteration summaries, and visual analysis prompts.
 
 </details>
 
@@ -549,7 +572,8 @@ Defines all MCP servers with connection details (command/args for stdio, url for
       "name": "GroundingAgent",
       "class_name": "GroundingAgent",
       "backend_scope": ["gui", "shell", "mcp", "system", "web"],
-      "max_iterations": 20
+      "max_iterations": 20,
+      "visual_analysis_timeout": 60.0
     },
     {
       "name": "EvalAgent",
@@ -559,7 +583,7 @@ Defines all MCP servers with connection details (command/args for stdio, url for
   ]
 }
 ```
-Configures agent roles, backend access scope, and execution limits.
+Configures agent roles, backend access scope, execution limits, and visual analysis timeout.
 
 **config_security.json** - Security Policies
 ```json
@@ -744,14 +768,18 @@ python -m fastagent --no-eval
 
 | Argument | Description |
 |----------|-------------|
-| `--model` | LLM model name |
-| `--query` | Single query mode |
+| `--config`, `-c` | Configuration file path (JSON format) |
+| `--model`, `-m` | LLM model name |
+| `--query`, `-q` | Single query mode: execute query directly |
 | `--timeout` | Max execution time (seconds) |
 | `--log-level` | DEBUG/INFO/WARNING/ERROR |
 | `--no-eval` | Disable evaluation |
-| `--no-workflow` | Disable workflow |
+| `--no-workflow` | Disable event-driven workflow |
 | `--max-iterations` | Max iterations |
-| `--no-ui` | Disable UI |
+| `--poll-interval` | Workflow polling interval (seconds) |
+| `--interactive`, `-i` | Force interactive mode |
+| `--no-ui` | Disable visual UI |
+| `--ui-compact` | Use compact UI layout |
 
 </details>
 
@@ -790,7 +818,8 @@ FastAgent uses a layered configuration system:
       "name": "GroundingAgent",
       "class_name": "GroundingAgent",
       "backend_scope": ["gui", "shell", "mcp", "system", "web"],
-      "max_iterations": 20
+      "max_iterations": 20,
+      "visual_analysis_timeout": 60.0
     },
     {
       "name": "EvalAgent",
@@ -808,6 +837,7 @@ FastAgent uses a layered configuration system:
 | `name` | Agent identifier | `"HostAgent"`, `"GroundingAgent"`, `"EvalAgent"` |
 | `backend_scope` | Accessible backends | `[]` (none) or any combination of `["gui", "shell", "mcp", "system", "web"]` |
 | `max_iterations` | Maximum execution cycles | Any integer (e.g., `20`, `50`) or `null` (unlimited) |
+| `visual_analysis_timeout` | Timeout for visual analysis (seconds) | Any float (default: `60.0`) |
 
 ---
 
@@ -861,6 +891,11 @@ FastAgent uses a layered configuration system:
 | **tool_search** | `search_mode` | Tool retrieval strategy | `"semantic"`, `"hybrid"` (semantic + LLM filter), or `"llm"` (default: `"hybrid"`) |
 | | `max_tools` | Maximum tools to index | Any integer (default: `300`) |
 | | `enable_cache_persistence` | Persist embedding cache | `true` or `false` (default: `true`) |
+| **tool_quality** | `enabled` | Enable tool quality tracking | `true` or `false` (default: `false`) |
+| | `enable_persistence` | Persist quality data to disk | `true` or `false` (default: `true`) |
+| | `cache_dir` | Quality data storage directory | Any valid path (default: `~/.fastagent/tool_quality`) |
+| | `enable_quality_ranking` | Adjust tool ranking by quality scores | `true` or `false` (default: `true`) |
+| | `evolve_interval` | Executions between quality evolution cycles | Any integer (default: `10`) |
 
 ---
 
