@@ -230,6 +230,7 @@ async def main():
     
     CLIDisplay.print_configuration(config)
     
+    agent: Optional[FastAgent] = None
     try:
         agent = await _initialize_agent(config, args)
         
@@ -254,7 +255,8 @@ async def main():
         return 1
     finally:
         print("\nCleaning up resources...")
-        await agent.cleanup()
+        if agent is not None:
+            await agent.cleanup()
     
     print("\nGoodbye!")
     return 0
