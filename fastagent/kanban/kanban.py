@@ -78,7 +78,7 @@ class KanbanCard:
         if isinstance(status, str):
             status = CardStatus(status)
         
-        return cls(
+        card = cls(
             card_id=data.get("card_id", ""),
             agent_name=data.get("agent_name", ""),
             card_type=card_type,
@@ -90,6 +90,9 @@ class KanbanCard:
             step=data.get("step"),
             metadata=data.get("metadata", {}),
         )
+        if "result" in data:
+            card.result = data["result"]
+        return card
     
     def update_status(self, status: CardStatus) -> None:
         """Update card status."""
