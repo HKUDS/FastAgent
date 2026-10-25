@@ -117,6 +117,22 @@ class ProcessedContent:
             
         return result
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ProcessedContent":
+        return cls(
+            content_type=ContentType(data["content_type"]),
+            level=ContentLevel(data["level"]),
+            title=data["title"],
+            status=data["status"],
+            structured_data=data.get("structured_data"),
+            entities=data.get("entities", {}),
+            full_data=data.get("full_data"),
+            summary=data.get("summary", ""),
+            operations=data.get("operations", []),
+            source_card_id=data.get("source_card_id"),
+            metadata=data.get("metadata", {}),
+        )
+
 
 class ContentProcessor:
     def __init__(
