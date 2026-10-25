@@ -206,7 +206,7 @@ class MCPToolCache:
         Args:
             servers: Dict mapping server_name -> list of sanitized tool metadata dicts
         """
-        self._ensure_dir()
+        self.sanitized_cache_path.parent.mkdir(parents=True, exist_ok=True)
         
         cache_data = {
             "version": self.CACHE_VERSION,
