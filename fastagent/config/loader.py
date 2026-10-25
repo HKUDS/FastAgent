@@ -80,23 +80,52 @@ def load_config(*config_paths: Union[str, Path]) -> GroundingConfig:
         raw_data = _load_multiple_files(paths)
         
         # Load MCP configuration (separate processing)
-        # Check if mcpServers already provided in merged custom configs
+        # Check if mcpServers or nested mcp.servers were provided in custom configs.
         has_custom_mcp_servers = "mcpServers" in raw_data
-        
+        custom_mcp_config = raw_data.get("mcp")
+        has_nested_custom_mcp_servers = (
+            isinstance(custom_mcp_config, dict) and "servers" in custom_mcp_config
+        )
+        nested_custom_mcp_servers = (
+            custom_mcp_config.get("servers")
+            if has_nested_custom_mcp_servers
+            else None
+        )
+
         if has_custom_mcp_servers:
-            # Use mcpServers from custom config
+            # Use the explicit top-level registry as a complete custom override.
             if "mcp" not in raw_data:
                 raw_data["mcp"] = {}
             raw_data["mcp"]["servers"] = raw_data.pop("mcpServers")
             logger.debug(f"Using custom MCP servers from provided config ({len(raw_data['mcp']['servers'])} servers)")
         else:
-            # Load default MCP servers from config_mcp.json
+            # Load default MCP servers from config_mcp.json, then apply any nested
+            # servers supplied by later grounding/dev configuration files.
             mcp_data = _load_json_file(CONFIG_DIR / CONFIG_MCP)
             if mcp_data and "mcpServers" in mcp_data:
                 if "mcp" not in raw_data:
                     raw_data["mcp"] = {}
-                raw_data["mcp"]["servers"] = mcp_data["mcpServers"]
-                logger.debug(f"Loaded MCP servers from default config_mcp.json ({len(raw_data['mcp']['servers'])} servers)")
+                default_mcp_servers = mcp_data["mcpServers"]
+                if (
+                    has_nested_custom_mcp_servers
+                    and isinstance(default_mcp_servers, dict)
+                    and isinstance(nested_custom_mcp_servers, dict)
+                ):
+                    raw_data["mcp"]["servers"] = _deep_merge_dict(
+                        default_mcp_servers,
+                        nested_custom_mcp_servers,
+                    )
+                    logger.debug(
+                        "Merged custom MCP servers with the default registry "
+                        "(%s custom entries)",
+                        len(nested_custom_mcp_servers),
+                    )
+                else:
+                    raw_data["mcp"]["servers"] = default_mcp_servers
+                    logger.debug(
+                        "Loaded MCP servers from default config_mcp.json (%s servers)",
+                        len(raw_data["mcp"]["servers"]),
+                    )
         
         # Validate and create configuration object
         try:
