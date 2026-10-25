@@ -391,7 +391,7 @@ Respond with JSON only:
         Provided as public API for explicit save when needed.
         """
         if self._store:
-            await self._store.save_all(self._records)
+            await self._store.save_all(self._records, self._global_execution_count)
     
     def clear_cache(self) -> None:
         """Clear all cached data."""
