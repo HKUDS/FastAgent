@@ -3,7 +3,8 @@ litellm>=1.70.0
 python-dotenv>=1.0.0
 openai>=1.0.0
 jsonschema>=4.25.0
-mcp>=1.0.0
+mcp>=1.8.0,<2.0.0
+websockets>=15.0
 anthropic>=0.71.0
 pillow>=12.0.0
 
