@@ -42,7 +42,9 @@ class ExecutionRecord:
         summary_data = self.processed.to_dict(ContentLevel.SUMMARY)
         item.add_values_from_dict(summary_data)
         
-        item.set_value("_processed_full", self.processed)
+        processed_data = self.processed.to_dict(ContentLevel.FULL)
+        processed_data["metadata"] = self.processed.metadata
+        item.set_value("_processed_full", processed_data)
         
         return item
     
@@ -54,6 +56,11 @@ class ExecutionRecord:
         processed = item.get_value("_processed_full")
         if not processed:
             logger.warning("Missing _processed_full, attempting to reconstruct")
+            return None
+        if isinstance(processed, dict):
+            processed = ProcessedContent.from_dict(processed)
+        elif not isinstance(processed, ProcessedContent):
+            logger.warning("Invalid _processed_full content; skipping execution record")
             return None
         
         return cls(
