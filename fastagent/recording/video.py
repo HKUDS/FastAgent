@@ -77,6 +77,7 @@ class VideoRecorder:
             logger.warning(f"Video recording failed to stop: {e}")
             return False
         finally:
+            self.is_recording = False
             if self._client:
                 try:
                     await self._client.close()
