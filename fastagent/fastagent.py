@@ -154,7 +154,7 @@ class FastAgentConfig:
     eval_system_prompt: Optional[str] = None
     
     # Execution Configuration
-    max_execution_time: float = 1000.0  # Maximum execution time (seconds), unified timeout control
+    max_execution_time: float = 3600.0  # Maximum execution time (seconds), unified timeout control
     max_iterations: Optional[int] = None  # Maximum iterations (optional, auto-calculated from max_execution_time if None)
     auto_evaluate: bool = True  # Whether to enable auto-evaluation
     
