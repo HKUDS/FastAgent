@@ -108,7 +108,10 @@ class Logger:
             if hasattr(__main__, "__file__") and __main__.__file__:
                 # Extract script name without extension
                 script_path = os.path.basename(__main__.__file__)
-                script_name = os.path.splitext(script_path)[0]
+                if script_path.startswith("<") and script_path.endswith(">"):
+                    script_name = "fastagent"
+                else:
+                    script_name = os.path.splitext(script_path)[0]
         except Exception:
             # If can't get script name, use default
             pass

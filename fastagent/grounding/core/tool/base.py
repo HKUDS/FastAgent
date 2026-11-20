@@ -126,10 +126,10 @@ class BaseTool(ABC):
 
     def run(self, **kwargs):
         try:
-            return asyncio.run(self.invoke(**kwargs))
-        except RuntimeError:                     # already in running loop
             loop = asyncio.get_running_loop()
-            return loop.create_task(self.invoke(**kwargs))
+        except RuntimeError:
+            return asyncio.run(self.invoke(**kwargs))
+        return loop.create_task(self.invoke(**kwargs))
 
     def __call__(self, **kwargs):
         return self.run(**kwargs)

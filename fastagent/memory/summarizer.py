@@ -68,6 +68,14 @@ class MemorySummarizer:
             old_items = memory.content[:items_to_compress]
             
             summary = await self._generate_summary(old_items)
+            if not summary.strip():
+                logger.warning("Empty summary generated; preserving memory items")
+                return {
+                    "compressed": False,
+                    "error": "Empty summary",
+                    "original_size": memory.length,
+                    "new_size": memory.length,
+                }
             
             self._summaries.append({
                 "timestamp": old_items[-1].get_value("timestamp") if old_items else None,

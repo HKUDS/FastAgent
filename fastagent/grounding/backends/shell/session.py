@@ -410,20 +410,23 @@ When you encounter an UNRECOVERABLE error that you cannot fix, end your response
 
     def _extract_output(self, result):
         if isinstance(result, dict):
-            # Check for execution errors
-            stderr = result.get("error") or result.get("stderr") or ""
+            # An explicit error or non-zero exit is a failure; stderr alone is not.
+            error = result.get("error") or ""
+            stderr = result.get("stderr") or ""
             returncode = result.get("returncode", 0)
             stdout = result.get("content") or result.get("output") or result.get("stdout") or ""
             
-            # If there's a non-zero return code or stderr with actual errors, report it
-            if returncode != 0 or (stderr and len(stderr.strip()) > 0):
+            if returncode != 0 or error:
                 error_msg = f"EXECUTION ERROR (exit code {returncode}):\n"
-                if stderr:
-                    error_msg += f"stderr: {stderr}\n"
+                error_detail = error or stderr
+                if error_detail:
+                    error_msg += f"stderr: {error_detail}\n"
                 if stdout:
                     error_msg += f"stdout: {stdout}"
                 return error_msg
             
+            if stderr:
+                return f"{stdout}\nstderr: {stderr}" if stdout else stderr
             return stdout or str(result)
         return str(result)
 
